@@ -43,10 +43,16 @@ jobs:
     #   2. PR author must be a maintainer (prevents review of community-
     #      authored PRs whose diff content could contain prompt-injection
     #      attempts against the LLM).
-    # For the `pull_request` auto-trigger we additionally require the head
-    # ref to live on `mlflow/mlflow` (no fork PRs). `author_association`
-    # alone doesn't prevent a community fork from a maintainer; combining
-    # both ensures the diff cannot come from an untrusted source.
+    # `pull_request` event also gets a `!draft` guard: `opened` fires for
+    # PRs opened directly in draft state too, so without this the bot would
+    # review drafts. The `ready_for_review` type handles the draft -> ready
+    # case separately, so we only want non-draft `opened` events through.
+    # The same maintainer-authored gate applies to PRs opened from forks as
+    # to PRs opened from branches on `mlflow/mlflow`: most maintainer PRs
+    # come from forks, so requiring `head.repo.full_name == github.repository`
+    # would prevent the auto-trigger from firing on the common case. The
+    # security model is the same as `/review-v2`: trust the maintainer's
+    # GitHub account, which both events depend on already.
     if: |
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
@@ -54,7 +60,7 @@ jobs:
        contains(fromJSON('["MEMBER", "COLLABORATOR", "OWNER"]'), github.event.comment.author_association) &&
        contains(fromJSON('["MEMBER", "COLLABORATOR", "OWNER"]'), github.event.issue.author_association)) ||
       (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository &&
+       !github.event.pull_request.draft &&
        contains(fromJSON('["MEMBER", "COLLABORATOR", "OWNER"]'), github.event.pull_request.author_association))
     runs-on: ubuntu-latest
     timeout-minutes: 15

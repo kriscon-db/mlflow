@@ -2230,23 +2230,80 @@ def _can_delete_or_prune_review_queue(queue, username: str) -> bool:
     )
 
 
-def _update_review_queue_reassigns_owner() -> bool:
-    """Whether an ``UpdateReviewQueue`` request reassigns the owner.
+def _parse_update_review_queue_request() -> UpdateReviewQueue:
+    """Parse the ``UpdateReviewQueue`` request body once for the gate to inspect.
 
-    Detected by parsing the proto and checking field presence — matching how the
-    handler reads it — rather than scanning raw JSON keys. Protobuf JSON accepts
-    both ``new_owner`` and its camelCase ``newOwner``, so a raw-key check would
-    miss the latter and under-gate the MANAGE-only owner reassignment.
+    Field presence is read from the parsed proto, not raw JSON keys, so protobuf
+    JSON's camelCase aliases (e.g. ``newOwner``) are detected the same way the
+    handler reads them; a raw-key scan would miss the camelCase form.
     """
     body = request.get_json(silent=True)
     message = UpdateReviewQueue()
     parse_dict(body if isinstance(body, dict) else {}, message)
-    return message.HasField("new_owner")
+    return message
+
+
+def _registered_username_match(name: object) -> str | None:
+    """The registered user whose name equals ``name`` (case-insensitive), or None.
+
+    User queues are named after their user (lowercased by ``normalize_user``), so a
+    custom queue or a rename that takes a username shadows that user's personal
+    queue. The match is intentionally case-insensitive — broader than the store's
+    case-sensitive name uniqueness — so a look-alike like ``"Alice"`` is rejected
+    too, not just the exact ``"alice"`` that would hard-collide and lock the user out.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return None
+    target = name.strip().lower()
+    return next(
+        (u.username for u in store.list_users() if u.username.strip().lower() == target), None
+    )
+
+
+def _reject_create_review_queue_shadowing_user():
+    """Reject creating a CUSTOM queue whose name is a registered username."""
+    from mlflow.genai.review_queues import ReviewQueueType
+
+    body = request.get_json(silent=True)
+    message = CreateReviewQueue()
+    parse_dict(body if isinstance(body, dict) else {}, message)
+    # Only CUSTOM queues choose an arbitrary name; a USER queue *is* its username.
+    # Compare the raw proto enum (an unset queue_type is 0/UNSPECIFIED, which
+    # `from_proto` would reject) so a non-CUSTOM request just skips the check.
+    if message.queue_type != ReviewQueueType.CUSTOM.to_proto():
+        return
+    if (matched := _registered_username_match(message.name)) is not None:
+        raise MlflowException.invalid_parameter_value(
+            f"'{matched}' is a registered user. A custom review queue cannot use a "
+            "username as its name; assign that user to a queue instead.",
+        )
+
+
+def _reject_rename_review_queue_shadowing_user(queue, message):
+    """Reject renaming a CUSTOM queue onto a registered username.
+
+    User queues can't be renamed at all (the store rejects that), so this only
+    concerns a CUSTOM queue being renamed onto a username.
+    """
+    from mlflow.genai.review_queues import ReviewQueueType
+
+    if queue.queue_type != ReviewQueueType.CUSTOM or not message.HasField("name"):
+        return
+    if (matched := _registered_username_match(message.name)) is not None:
+        raise MlflowException.invalid_parameter_value(
+            f"'{matched}' is a registered user. A custom review queue cannot be "
+            "renamed to a username; assign that user to a queue instead.",
+        )
 
 
 def validate_can_create_review_queue():
     # Creating (and thereby owning) a queue requires experiment EDIT.
-    return _get_permission_from_experiment_id().can_update
+    permission = _get_permission_from_experiment_id().can_update
+    # A custom queue may not take a registered username, which would shadow that
+    # user's personal queue. Only enforced once the caller is authorized.
+    if permission:
+        _reject_create_review_queue_shadowing_user()
+    return permission
 
 
 def validate_can_update_review_queue():
@@ -2255,9 +2312,15 @@ def validate_can_update_review_queue():
     # an owner cannot transfer their own queue.
     username = authenticate_request().username
     queue = _get_tracking_store().get_review_queue(_get_request_param("queue_id"))
-    if _update_review_queue_reassigns_owner():
-        return _get_experiment_permission(queue.experiment_id, username).can_manage
-    return _can_own_or_manage_review_queue(queue, username)
+    message = _parse_update_review_queue_request()
+    if message.HasField("new_owner"):
+        permission = _get_experiment_permission(queue.experiment_id, username).can_manage
+    else:
+        permission = _can_own_or_manage_review_queue(queue, username)
+    # A rename can't take a registered username either (same shadowing concern).
+    if permission:
+        _reject_rename_review_queue_shadowing_user(queue, message)
+    return permission
 
 
 def validate_can_remove_items_from_review_queue():

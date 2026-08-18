@@ -28,12 +28,14 @@ from mlflow.assistant.providers.base import (
 )
 from mlflow.assistant.providers.prompts import ASSISTANT_SYSTEM_PROMPT
 from mlflow.assistant.providers.tool_executor import (
+    _SANDBOX_TOOLS,
     CLIENT_TOOLS,
     build_tools_schema,
     execute_tool,
     static_permission_error,
 )
 from mlflow.assistant.types import Event, Message, ToolResultBlock, ToolUseBlock
+from mlflow.environment_variables import MLFLOW_ENABLE_ASSISTANT_SANDBOX
 from mlflow.tracing.constant import CostKey, TokenUsageKey
 from mlflow.tracing.utils import calculate_cost_by_model_and_token_usage
 
@@ -314,7 +316,7 @@ class OpenAICompatibleProvider(AssistantProvider):
             return self._default_base_url.rstrip("/")
         return None
 
-    def _auth_headers(self, api_key: str | None) -> dict[str, str]:
+    def _auth_headers(self, api_key: str | None, caller: str | None = None) -> dict[str, str]:
         if api_key:
             return {"Authorization": f"Bearer {api_key}"}
         return {}
@@ -377,6 +379,7 @@ class OpenAICompatibleProvider(AssistantProvider):
         mlflow_session_id: str | None = None,
         cwd: Path | None = None,
         context: dict[str, Any] | None = None,
+        caller: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         config = self._load_config()
         base_url = (config.base_url or self._default_base_url or "").rstrip("/") or None
@@ -457,7 +460,7 @@ class OpenAICompatibleProvider(AssistantProvider):
             messages.append({"role": "user", "content": user_text})
         tools = build_tools_schema()
 
-        headers = self._auth_headers(api_key)
+        headers = self._auth_headers(api_key, caller=caller)
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -689,10 +692,19 @@ class OpenAICompatibleProvider(AssistantProvider):
                             static_permission_error(tool_name, tool_input, config.permissions, cwd)
                             is not None
                         )
+                        # When the sandbox is enabled, compute tools run in an isolated
+                        # per-session container (execute_tool routes them there), so isolation
+                        # is the safety boundary and they are auto-approved rather than prompted.
+                        sandboxed = (
+                            MLFLOW_ENABLE_ASSISTANT_SANDBOX.get()
+                            and bool(mlflow_session_id)
+                            and tool_name in _SANDBOX_TOOLS
+                        )
                         gated = (
                             not config.permissions.full_access
                             and bool(mlflow_session_id)
                             and needs_prompt
+                            and not sandboxed
                         )
                         decision = tool_decisions.get(tc["id"])
 

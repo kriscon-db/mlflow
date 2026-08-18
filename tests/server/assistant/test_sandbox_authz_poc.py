@@ -133,3 +133,22 @@ def test_execute_tool_stays_in_process_without_session(monkeypatch):
             )
         )
     mock_run.assert_not_called()
+
+
+def test_gateway_provider_authenticates_to_in_server_gateway_with_internal_token(monkeypatch):
+    # On an auth-enabled server the Assistant's server-side call to the in-server AI Gateway
+    # must send Basic (caller, internal_token) so it authenticates AND attributes to the user.
+    from mlflow.assistant.providers.mlflow_gateway import MlflowGatewayProvider
+
+    monkeypatch.setenv("_MLFLOW_INTERNAL_GATEWAY_AUTH_TOKEN", "sekret-token")
+    headers = MlflowGatewayProvider()._auth_headers(api_key=None, caller="alice")
+    assert headers["Authorization"] == "Basic " + base64.b64encode(b"alice:sekret-token").decode()
+
+
+def test_gateway_provider_no_auth_header_without_token(monkeypatch):
+    # No internal token (e.g. a no-auth server) -> fall back to the default (no header when
+    # there's no api_key), rather than sending a broken credential.
+    from mlflow.assistant.providers.mlflow_gateway import MlflowGatewayProvider
+
+    monkeypatch.delenv("_MLFLOW_INTERNAL_GATEWAY_AUTH_TOKEN", raising=False)
+    assert MlflowGatewayProvider()._auth_headers(api_key=None, caller="alice") == {}

@@ -480,7 +480,8 @@ async def stream_response(request: Request, session_id: str) -> StreamingRespons
     session = SessionManager.load(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    _authorize_session_access(session, _resolve_caller_identity(request))
+    caller = _resolve_caller_identity(request)
+    _authorize_session_access(session, caller)
 
     # A turn is driven by a pending user message (a new turn) or pending tool-call
     # decisions/results (resuming a turn paused at a permission prompt or a
@@ -531,6 +532,7 @@ async def stream_response(request: Request, session_id: str) -> StreamingRespons
             mlflow_session_id=session_id,
             cwd=session.working_dir,
             context=context,
+            caller=caller,
         ):
             # Store provider session ID if returned (for conversation continuity).
             # On a paused or failed turn this lets a later request resume the same

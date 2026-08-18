@@ -78,6 +78,7 @@ class MockProvider(AssistantProvider):
         mlflow_session_id: str | None = None,
         cwd: Path | None = None,
         context: dict[str, Any] | None = None,
+        caller: str | None = None,
     ):
         yield Event.from_message(message=Message(role="user", content="Hello from mock"))
         yield Event.from_result(result="complete", session_id="mock-session-123")
@@ -870,6 +871,7 @@ class _DeferredProvider(MockProvider):
         mlflow_session_id=None,
         cwd=None,
         context=None,
+        caller=None,
     ):
         decisions = (context or {}).get("tool_decisions") or {}
         if not decisions:
@@ -941,6 +943,7 @@ class _CaptureProvider(MockProvider):
         mlflow_session_id=None,
         cwd=None,
         context=None,
+        caller=None,
     ):
         self.captured = {"prompt": prompt, "tracking_uri": tracking_uri, "context": context or {}}
         yield Event.from_result(result=None, session_id="prov-done")
@@ -958,6 +961,7 @@ class _ErrorThenCaptureProvider(MockProvider):
         mlflow_session_id=None,
         cwd=None,
         context=None,
+        caller=None,
     ):
         self.session_ids.append(session_id)
         if len(self.session_ids) == 1:

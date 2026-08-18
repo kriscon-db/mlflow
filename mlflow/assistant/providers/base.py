@@ -113,6 +113,7 @@ class AssistantProvider(ABC):
         mlflow_session_id: str | None = None,
         cwd: Path | None = None,
         context: dict[str, Any] | None = None,
+        caller: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         """
         Stream responses from the assistant asynchronously.
@@ -125,6 +126,8 @@ class AssistantProvider(ABC):
             cwd: Working directory for the assistant
             context: Additional context for the assistant, such as information from
                 the current UI page the user is viewing (e.g., experimentId, traceId)
+            caller: Identity of the authenticated user driving this turn, used to
+                authenticate/attribute server-side AI Gateway requests.
 
         Yields:
             Event objects with 'type' and 'data' payloads.

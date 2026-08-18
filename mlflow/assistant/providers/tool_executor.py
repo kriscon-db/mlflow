@@ -16,6 +16,9 @@ _FILE_TOOLS = {"Read", "Write", "Edit"}
 _ALLOWED_BASH_COMMANDS = {"mlflow", "python3", "python"}
 # Compute tools that run in the per-session sandbox when MLFLOW_ENABLE_ASSISTANT_SANDBOX is set.
 _SANDBOX_TOOLS = {"Bash", "Read", "Write", "Edit"}
+# Server-side data tools (the data tier): run in the server under the caller's RBAC and
+# materialize results into the sandbox. Names mirror mlflow.server.assistant.sandbox.data_tools.
+_SERVER_DATA_TOOLS = {"search_traces", "get_trace"}
 
 # Tools executed on the CLIENT (browser), not the server: the assistant loop pauses the turn and
 # waits for a client-submitted result instead of routing the call through execute_tool/the static
@@ -89,7 +92,23 @@ async def execute_tool(
     tracking_uri: str | None = None,
     permissions: PermissionsConfig | None = None,
     session_id: str | None = None,
+    caller: str | None = None,
 ) -> tuple[str, bool]:
+    # Data tier: server-side, RBAC-checked read tools that fetch MLflow data as the caller and
+    # materialize it into the sandbox. Run in the server process (which holds the store + identity),
+    # never in the network-isolated sandbox.
+    if session_id and MLFLOW_ENABLE_ASSISTANT_SANDBOX.get() and tool_name in _SERVER_DATA_TOOLS:
+        from mlflow.server.assistant.sandbox.data_tools import run_data_tool
+
+        _logger.info("routing tool %s for session %s -> server data tier", tool_name, session_id)
+        try:
+            return await asyncio.to_thread(
+                run_data_tool, caller, session_id, tool_name, tool_input, tracking_uri
+            )
+        except Exception as e:
+            _logger.exception("data tool failed for %s", tool_name)
+            return f"Data tool failed: {e}", True
+
     # When the Assistant sandbox is enabled, compute tools run inside the session's isolated
     # container instead of the server process. Isolation is the safety boundary, so the static
     # host-permission gate (workspace confinement, allow-listed commands) is bypassed here.
@@ -328,4 +347,53 @@ def build_tools_schema() -> list[dict[str, Any]]:
                 },
             },
         },
-    ]
+    ] + (_DATA_TOOL_SCHEMAS if MLFLOW_ENABLE_ASSISTANT_SANDBOX.get() else [])
+
+
+# Advertised only when the sandbox (data tier) is enabled; execute_tool routes these to the
+# server-side, RBAC-checked data tools which materialize results into the sandbox workspace.
+_DATA_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_traces",
+            "description": (
+                "Search MLflow traces in an experiment and materialize the full trace JSON into "
+                "your sandbox workspace under traces/<trace_id>.json for analysis with the "
+                "compute tools (Bash/Read). Returns a summary of what was written."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "experiment_id": {
+                        "type": "string",
+                        "description": "The experiment to search traces in.",
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description": "Optional MLflow trace filter string.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max traces to fetch (default 10).",
+                    },
+                },
+                "required": ["experiment_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_trace",
+            "description": "Fetch a single MLflow trace by ID and return its full JSON inline.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "trace_id": {"type": "string", "description": "The trace ID to fetch."},
+                },
+                "required": ["trace_id"],
+            },
+        },
+    },
+]

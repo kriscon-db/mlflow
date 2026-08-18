@@ -759,6 +759,7 @@ class OpenAICompatibleProvider(AssistantProvider):
                             tracking_uri=tracking_uri,
                             permissions=effective_permissions,
                             session_id=mlflow_session_id,
+                            caller=caller,
                         )
 
                         yield Event.from_message(

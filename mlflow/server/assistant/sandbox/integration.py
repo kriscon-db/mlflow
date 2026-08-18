@@ -55,6 +55,21 @@ def _to_tool_call(tool_name: str, tool_input: dict[str, Any]) -> ToolCall | None
             return None
 
 
+def _ensure_session(executor, session_id, tracking_uri, owner=None):
+    """Lazily start the session's sandbox; return a one-shot resume notice if one is pending."""
+    notice = None
+    if not executor.is_active(session_id):
+        # A resume after the sandbox was reaped for inactivity: tell the agent its scratch
+        # workspace was reset (returns None for a brand-new session that was never started).
+        notice = executor.consume_reap_notice(session_id)
+        if notice:
+            _logger.info("assistant sandbox: delivering resume notice to session %s", session_id)
+        executor.start_session(
+            SessionContext(session_id=session_id, tracking_uri=tracking_uri or "", owner=owner)
+        )
+    return notice
+
+
 def run_sandboxed_tool(
     session_id: str,
     tool_name: str,
@@ -69,19 +84,26 @@ def run_sandboxed_tool(
     if call is None:
         return f"Unknown sandbox tool: {tool_name}", True
     executor = _get_executor()
-    notice: str | None = None
-    if not executor.is_active(session_id):
-        # A resume after the sandbox was reaped for inactivity: tell the agent its scratch
-        # workspace was reset (returns None for a brand-new session that was never started).
-        notice = executor.consume_reap_notice(session_id)
-        if notice:
-            _logger.info("assistant sandbox: delivering resume notice to session %s", session_id)
-        executor.start_session(
-            SessionContext(session_id=session_id, tracking_uri=tracking_uri or "")
-        )
+    notice = _ensure_session(executor, session_id, tracking_uri)
     result = executor.exec_in_session(session_id, call)
     output = f"{notice}\n{result.output}" if notice else result.output
     return output, result.is_error
+
+
+def materialize_in_sandbox(
+    session_id: str, rel_path: str, content: str, tracking_uri: str | None = None, owner=None
+) -> None:
+    """Write server-fetched data (e.g. traces) into the session's sandbox workspace so the
+    agent's compute tools can analyze it. Reuses the sandbox write path; lazy-starts the
+    session. Data flows server -> sandbox only; the sandbox never reaches out for it.
+    """
+    executor = _get_executor()
+    _ensure_session(executor, session_id, tracking_uri, owner=owner)
+    result = executor.exec_in_session(
+        session_id, ToolCall("write", {"path": rel_path, "content": content})
+    )
+    if result.is_error:
+        raise RuntimeError(f"Failed to materialize {rel_path} into the sandbox: {result.output}")
 
 
 def stop_sandbox_session(session_id: str) -> None:

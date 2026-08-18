@@ -152,3 +152,53 @@ def test_gateway_provider_no_auth_header_without_token(monkeypatch):
 
     monkeypatch.delenv("_MLFLOW_INTERNAL_GATEWAY_AUTH_TOKEN", raising=False)
     assert MlflowGatewayProvider()._auth_headers(api_key=None, caller="alice") == {}
+
+
+def test_execute_tool_routes_data_tools_to_server_tier(monkeypatch):
+    # Data tools (search_traces/get_trace) run server-side under the caller's RBAC, NOT in the
+    # sandbox. execute_tool must dispatch them to run_data_tool with the caller identity.
+    monkeypatch.setenv("MLFLOW_ENABLE_ASSISTANT_SANDBOX", "true")
+    with mock.patch(
+        "mlflow.server.assistant.sandbox.data_tools.run_data_tool",
+        return_value=("{}", False),
+    ) as mock_data:
+        asyncio.run(
+            execute_tool("search_traces", {"experiment_id": "1"}, session_id="s1", caller="alice")
+        )
+    mock_data.assert_called_once()
+    # caller + session_id + tool name are forwarded so RBAC + materialization can happen.
+    args = mock_data.call_args.args
+    assert args[0] == "alice"
+    assert args[1] == "s1"
+    assert args[2] == "search_traces"
+
+
+def test_data_tools_advertised_only_when_sandbox_enabled(monkeypatch):
+    from mlflow.assistant.providers.tool_executor import build_tools_schema
+
+    monkeypatch.setenv("MLFLOW_ENABLE_ASSISTANT_SANDBOX", "true")
+    names_on = {t["function"]["name"] for t in build_tools_schema()}
+    assert {"search_traces", "get_trace"} <= names_on
+
+    monkeypatch.setenv("MLFLOW_ENABLE_ASSISTANT_SANDBOX", "false")
+    names_off = {t["function"]["name"] for t in build_tools_schema()}
+    assert not ({"search_traces", "get_trace"} & names_off)
+
+
+def test_data_tool_rbac_denies_without_read(monkeypatch):
+    # The data tier re-checks the caller's experiment permission; a denied caller gets an
+    # error result (not the data), even though the tool routing succeeded.
+    import sys
+    import types
+
+    from mlflow.server.assistant.sandbox import data_tools
+
+    fake_auth = types.ModuleType("mlflow.server.auth")
+    fake_auth.is_auth_enabled = lambda: True
+    fake_auth._get_experiment_permission = lambda eid, user: types.SimpleNamespace(can_read=False)
+    with mock.patch.dict(sys.modules, {"mlflow.server.auth": fake_auth}):
+        out, is_error = data_tools.run_data_tool(
+            "mallory", "s1", "search_traces", {"experiment_id": "7"}
+        )
+    assert is_error
+    assert "Permission denied" in out

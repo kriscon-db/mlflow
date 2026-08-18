@@ -124,6 +124,25 @@ MLFLOW_ENABLE_REMOTE_ASSISTANT = _BooleanEnvironmentVariable(
     "MLFLOW_ENABLE_REMOTE_ASSISTANT", False
 )
 
+#: [POC] Opt-in flag that lets OSS (non-Databricks) backends register and run custom
+#: ``@scorer`` code scorers by executing their source in a sandbox instead of the
+#: server/worker process. Off by default because it lifts the RCE-protection gate.
+#: NOTE: the isolation strength depends on ``MLFLOW_SCORER_SANDBOX_PROVIDER``. The default
+#: ``subprocess`` provider scrubs env vars and caps CPU/wall-time but does NOT confine
+#: filesystem reads or network egress; only the ``docker`` provider isolates fs + network.
+#: (default: ``False``)
+MLFLOW_ENABLE_SERVER_SIDE_CODE_SCORERS = _BooleanEnvironmentVariable(
+    "MLFLOW_ENABLE_SERVER_SIDE_CODE_SCORERS", False
+)
+
+#: [POC] Opt-in flag that runs the MLflow Assistant's compute tools (Bash/Read/Write/Edit)
+#: inside a per-session Docker sandbox instead of the server process, so the Assistant can
+#: be exposed to remote/multi-user servers without executing untrusted tool calls on the host.
+#: (default: ``False``)
+MLFLOW_ENABLE_ASSISTANT_SANDBOX = _BooleanEnvironmentVariable(
+    "MLFLOW_ENABLE_ASSISTANT_SANDBOX", False
+)
+
 #: When true, newly created workspaces are seeded with two default RBAC roles
 #: (``admin``, ``user``) that super-admins can assign to other
 #: users. ``CreateWorkspace`` is gated to super-admins, whose ``is_admin`` flag already

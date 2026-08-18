@@ -916,7 +916,7 @@ async def test_stream_pauses_then_resumes(decision, expected_text):
 
     # Deliver the decision, then a fresh stream resumes to completion.
     res = await resolve_permission(
-        session_id, PermissionDecision(request_id="t1", decision=decision)
+        session_id, PermissionDecision(request_id="t1", decision=decision), mock_request
     )
     assert res.session_id == session_id
 

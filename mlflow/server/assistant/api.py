@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import enum
 import ipaddress
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -35,10 +37,15 @@ from mlflow.assistant.providers.base import (
 )
 from mlflow.assistant.skill_installer import install_skills, list_installed_skills
 from mlflow.assistant.types import EventType
-from mlflow.environment_variables import MLFLOW_ENABLE_REMOTE_ASSISTANT
+from mlflow.environment_variables import (
+    MLFLOW_ENABLE_ASSISTANT_SANDBOX,
+    MLFLOW_ENABLE_REMOTE_ASSISTANT,
+)
 from mlflow.server.asgi_utils import get_server_base_url
 from mlflow.server.assistant.session import SessionManager, terminate_session_process
 from mlflow.server.handlers import _add_static_prefix
+
+_logger = logging.getLogger(__name__)
 
 
 def _get_provider(name: str):
@@ -100,6 +107,73 @@ def _enforce_remote_access(request: Request, provider: AssistantProvider | None)
         return
     if not _provider_allows_remote_access(provider):
         raise HTTPException(status_code=403, detail=_BLOCK_REMOTE_ACCESS_ERROR_MSG)
+
+
+def _resolve_caller_identity(request: Request) -> str:
+    """Identify the user making the request (the entry-gate principal).
+
+    When MLflow's auth is enabled, its FastAPI middleware has already authenticated the
+    request and stored the principal on ``request.state.username`` (it guards the assistant
+    routes), so we use that — the authoritative identity. Otherwise (no auth / localhost dev)
+    we fall back to a forwarded-user header, HTTP Basic credentials, or the single local user.
+    """
+    if username := getattr(request.state, "username", None):
+        _logger.debug("assistant caller resolved as %r (authenticated principal)", username)
+        return username
+    # No authenticated principal => MLflow auth is not active for this request. Client-supplied
+    # identity (x-mlflow-user / Basic) is only trustworthy for localhost single-user dev; a
+    # REMOTE client could otherwise spoof x-mlflow-user to impersonate any user and drive their
+    # session/sandbox. So remote + no-auth collapses to one shared anonymous principal.
+    if not _is_localhost(request):
+        _logger.debug("assistant caller is remote with no auth -> 'remote-anonymous'")
+        return "remote-anonymous"
+    if user := request.headers.get("x-mlflow-user"):
+        return user
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Basic "):
+        try:
+            return base64.b64decode(auth[6:]).decode().split(":", 1)[0] or "unknown"
+        except Exception:
+            pass
+    return "local"
+
+
+def _authorize_session_access(session, caller: str) -> None:
+    """Reject a caller that does not own the session (one user cannot drive another's
+    session or its sandbox). Legacy sessions with no recorded owner are not enforced.
+    """
+    if session.owner is not None and session.owner != caller:
+        _logger.warning(
+            "assistant session access denied: caller=%r is not owner=%r", caller, session.owner
+        )
+        raise HTTPException(status_code=403, detail="You do not have access to this session.")
+
+
+def _authorize_experiment_access(caller: str, experiment_id: str | None) -> None:
+    """Require the caller to have read access to the experiment when RBAC is enabled.
+
+    Reuses MLflow's own permission API, and only enforces when the server runs with the
+    auth app (``is_auth_enabled()``), so localhost/no-auth development is unaffected. Fails
+    safe (no enforcement) if the auth plugin isn't importable.
+    """
+    if experiment_id is None:
+        return
+    try:
+        from mlflow.server.auth import _get_experiment_permission, is_auth_enabled
+    except ImportError:
+        return
+    if not is_auth_enabled():
+        return
+    if not _get_experiment_permission(experiment_id, caller).can_read:
+        _logger.warning(
+            "assistant experiment access denied: caller=%r cannot read experiment %s",
+            caller,
+            experiment_id,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"You do not have read access to experiment {experiment_id}.",
+        )
 
 
 # Per-route remote-access policy:
@@ -340,16 +414,20 @@ class SkillsInstallResponse(BaseModel):
 
 @assistant_router.post("/message")
 @_remote_access_policy(_RemoteAccessPolicy.ONLY_SAFE_PROVIDER)
-async def send_message(request: MessageRequest) -> MessageResponse:
+async def send_message(request: MessageRequest, http_request: Request) -> MessageResponse:
     """
     Send a message to the assistant and get a session for streaming the response.
 
     Args:
         request: MessageRequest with message, context, and optional session_id
+        http_request: The FastAPI request, used to identify the calling user
 
     Returns:
         MessageResponse with session_id and stream_url
     """
+    caller = _resolve_caller_identity(http_request)
+    _authorize_experiment_access(caller, request.experiment_id)
+
     # Generate or use existing session ID
     session_id = request.session_id or str(uuid.uuid4())
 
@@ -359,9 +437,13 @@ async def send_message(request: MessageRequest) -> MessageResponse:
     session = SessionManager.load(session_id)
     if session is None:
         session = SessionManager.create(
-            context=request.context, working_dir=Path(project_path) if project_path else None
+            context=request.context,
+            working_dir=Path(project_path) if project_path else None,
+            owner=caller,
         )
+        _logger.info("assistant session %s created (owner=%r)", session_id, caller)
     else:
+        _authorize_session_access(session, caller)
         # Page context is merged for conversation continuity, but feature modes
         # are turn-scoped. Remove omitted transient keys so leaving a feature
         # cannot keep later turns in its provider/output mode.
@@ -398,6 +480,7 @@ async def stream_response(request: Request, session_id: str) -> StreamingRespons
     session = SessionManager.load(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_access(session, _resolve_caller_identity(request))
 
     # A turn is driven by a pending user message (a new turn) or pending tool-call
     # decisions/results (resuming a turn paused at a permission prompt or a
@@ -472,7 +555,9 @@ async def stream_response(request: Request, session_id: str) -> StreamingRespons
 
 @assistant_router.patch("/sessions/{session_id}")
 @_remote_access_policy(_RemoteAccessPolicy.ONLY_SAFE_PROVIDER)
-async def patch_session(session_id: str, request: SessionPatchRequest) -> SessionPatchResponse:
+async def patch_session(
+    session_id: str, request: SessionPatchRequest, http_request: Request
+) -> SessionPatchResponse:
     """
     Update session status.
 
@@ -482,6 +567,7 @@ async def patch_session(session_id: str, request: SessionPatchRequest) -> Sessio
     Args:
         session_id: The session ID
         request: SessionPatchRequest with status to set
+        http_request: The FastAPI request, used to identify the calling user
 
     Returns:
         SessionPatchResponse indicating success
@@ -489,6 +575,7 @@ async def patch_session(session_id: str, request: SessionPatchRequest) -> Sessio
     session = SessionManager.load(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_access(session, _resolve_caller_identity(http_request))
 
     if request.status == "cancelled":
         # Terminate any associated subprocess. The OpenAI-compatible provider
@@ -498,6 +585,11 @@ async def patch_session(session_id: str, request: SessionPatchRequest) -> Sessio
         session.pending_client_tool_results = {}
         SessionManager.save(session_id, session)
         terminated = terminate_session_process(session_id)
+        # Tear down the per-session sandbox (if any) so it isn't left running.
+        if MLFLOW_ENABLE_ASSISTANT_SANDBOX.get():
+            from mlflow.server.assistant.sandbox.integration import stop_sandbox_session
+
+            await asyncio.to_thread(stop_sandbox_session, session_id)
         msg = "Session cancelled and process terminated" if terminated else "Session cancelled"
         return SessionPatchResponse(message=msg)
 
@@ -507,7 +599,9 @@ async def patch_session(session_id: str, request: SessionPatchRequest) -> Sessio
 
 @assistant_router.post("/sessions/{session_id}/permission")
 @_remote_access_policy(_RemoteAccessPolicy.ONLY_SAFE_PROVIDER)
-async def resolve_permission(session_id: str, request: PermissionDecision) -> MessageResponse:
+async def resolve_permission(
+    session_id: str, request: PermissionDecision, http_request: Request
+) -> MessageResponse:
     """Deliver a tool-call permission decision and resume the paused turn on a new stream.
 
     The decision is stored on the session and consumed by the next stream, which
@@ -523,6 +617,7 @@ async def resolve_permission(session_id: str, request: PermissionDecision) -> Me
     session = SessionManager.load(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_access(session, _resolve_caller_identity(http_request))
 
     session.pending_tool_decisions = {request.request_id: request.decision}
     SessionManager.save(session_id, session)
@@ -537,7 +632,9 @@ async def resolve_permission(session_id: str, request: PermissionDecision) -> Me
 
 @assistant_router.post("/sessions/{session_id}/tool-result")
 @_remote_access_policy(_RemoteAccessPolicy.ONLY_SAFE_PROVIDER)
-async def resolve_client_tool_result(session_id: str, request: ClientToolResult) -> MessageResponse:
+async def resolve_client_tool_result(
+    session_id: str, request: ClientToolResult, http_request: Request
+) -> MessageResponse:
     """Deliver a client-executed tool's result and resume the paused turn on a new stream.
 
     Mirrors `resolve_permission`: the result is stored on the session and consumed
@@ -552,6 +649,7 @@ async def resolve_client_tool_result(session_id: str, request: ClientToolResult)
     session = SessionManager.load(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_access(session, _resolve_caller_identity(http_request))
 
     session.pending_client_tool_results = {
         request.request_id: {"content": request.content, "is_error": request.is_error}

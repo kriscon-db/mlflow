@@ -21,6 +21,10 @@ class Session:
     pending_message: Message | None = None
     provider_session_id: str | None = None
     working_dir: Path | None = None  # Working directory for the session (e.g. project path)
+    # Identity of the user who created the session. Requests for this session must come from
+    # the same caller (see the api.py entry gate), so one user cannot drive another's session
+    # or its sandbox. None on legacy sessions created before ownership existed.
+    owner: str | None = None
     # tool_call_id -> "allow" | "deny": a decision awaiting the next stream so a
     # turn paused at a permission prompt can resume. Set by the resume endpoint,
     # consumed (and cleared) by the stream.
@@ -81,6 +85,7 @@ class Session:
             "working_dir": self.working_dir.as_posix() if self.working_dir else None,
             "pending_tool_decisions": self.pending_tool_decisions,
             "pending_client_tool_results": self.pending_client_tool_results,
+            "owner": self.owner,
         }
 
     @classmethod
@@ -105,6 +110,7 @@ class Session:
             working_dir=Path(data.get("working_dir")) if data.get("working_dir") else None,
             pending_tool_decisions=data.get("pending_tool_decisions") or {},
             pending_client_tool_results=data.get("pending_client_tool_results") or {},
+            owner=data.get("owner"),
         )
 
 
@@ -184,17 +190,22 @@ class SessionManager:
         return Session.from_dict(data)
 
     @staticmethod
-    def create(context: dict[str, Any] | None = None, working_dir: Path | None = None) -> Session:
+    def create(
+        context: dict[str, Any] | None = None,
+        working_dir: Path | None = None,
+        owner: str | None = None,
+    ) -> Session:
         """Create a new session.
 
         Args:
             context: Initial context data, or None
             working_dir: Working directory for the session
+            owner: Identity of the creating user (see the api.py entry gate)
 
         Returns:
             New Session instance
         """
-        return Session(context=context or {}, working_dir=working_dir)
+        return Session(context=context or {}, working_dir=working_dir, owner=owner)
 
 
 def get_process_file(session_id: str) -> Path:

@@ -746,6 +746,7 @@ class OpenAICompatibleProvider(AssistantProvider):
                             cwd=cwd,
                             tracking_uri=tracking_uri,
                             permissions=effective_permissions,
+                            session_id=mlflow_session_id,
                         )
 
                         yield Event.from_message(

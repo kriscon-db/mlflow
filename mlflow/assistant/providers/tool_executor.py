@@ -7,12 +7,15 @@ from typing import Any
 
 from mlflow.assistant.config import PermissionsConfig
 from mlflow.assistant.custom_view import RENDER_CUSTOM_VIEW_TOOL_NAME
+from mlflow.environment_variables import MLFLOW_ENABLE_ASSISTANT_SANDBOX
 
 _logger = logging.getLogger(__name__)
 
 _FILE_TOOLS = {"Read", "Write", "Edit"}
 # Restricted mode only permits MLflow CLI and Python; anything else needs Full Access.
 _ALLOWED_BASH_COMMANDS = {"mlflow", "python3", "python"}
+# Compute tools that run in the per-session sandbox when MLFLOW_ENABLE_ASSISTANT_SANDBOX is set.
+_SANDBOX_TOOLS = {"Bash", "Read", "Write", "Edit"}
 
 # Tools executed on the CLIENT (browser), not the server: the assistant loop pauses the turn and
 # waits for a client-submitted result instead of routing the call through execute_tool/the static
@@ -85,7 +88,28 @@ async def execute_tool(
     cwd: Path | None = None,
     tracking_uri: str | None = None,
     permissions: PermissionsConfig | None = None,
+    session_id: str | None = None,
 ) -> tuple[str, bool]:
+    # When the Assistant sandbox is enabled, compute tools run inside the session's isolated
+    # container instead of the server process. Isolation is the safety boundary, so the static
+    # host-permission gate (workspace confinement, allow-listed commands) is bypassed here.
+    # Only the server-loop providers (openai_compatible / mlflow_gateway) reach this path with a
+    # session_id; the CLI providers (claude_code, codex) run their own host process and are
+    # localhost-only (allows_remote_access=False), so they never expose host exec to remote users.
+    if session_id and MLFLOW_ENABLE_ASSISTANT_SANDBOX.get() and tool_name in _SANDBOX_TOOLS:
+        from mlflow.server.assistant.sandbox.integration import run_sandboxed_tool
+
+        _logger.info("routing tool %s for session %s -> sandbox", tool_name, session_id)
+        try:
+            return await asyncio.to_thread(
+                run_sandboxed_tool, session_id, tool_name, tool_input, tracking_uri
+            )
+        except Exception as e:
+            # Docker missing/daemon down, or the sandbox was torn down mid-call: surface a
+            # tool error to the model instead of crashing the streaming turn.
+            _logger.exception("sandbox execution failed for tool %s", tool_name)
+            return f"Sandbox unavailable: {e}", True
+
     perms = permissions or PermissionsConfig()
 
     if (denial := static_permission_error(tool_name, tool_input, perms, cwd)) is not None:

@@ -14,6 +14,7 @@ import mlflow
 from mlflow.entities import Assessment, Feedback
 from mlflow.entities.assessment import DEFAULT_FEEDBACK_NAME
 from mlflow.entities.trace import Trace
+from mlflow.environment_variables import MLFLOW_ENABLE_SERVER_SIDE_CODE_SCORERS
 from mlflow.exceptions import MlflowException
 from mlflow.genai.scorers.ensemble import (
     BOOL_ENSEMBLES,
@@ -673,6 +674,10 @@ class Scorer(BaseModel):
         # registration is gated behind authentication. OSS backends don't have this guarantee,
         # so block loading to prevent executing untrusted code.
         if not is_databricks_uri(get_tracking_uri()):
+            # [POC] Delight: when the operator opts in, don't exec the source in this process.
+            # Return a scorer whose calls ship the source to a sandbox subprocess instead.
+            if MLFLOW_ENABLE_SERVER_SIDE_CODE_SCORERS.get():
+                return _make_sandboxed_decorator_scorer(serialized)
             code_snippet = (
                 "\n\nfrom mlflow.genai import scorer\n\n"
                 f"@scorer\ndef {serialized.original_func_name}{serialized.call_signature}:\n"
@@ -1238,7 +1243,11 @@ class Scorer(BaseModel):
         # execution risk. Only allow registration when using Databricks tracking URI.
         # Registration itself is safe (just stores code), but we restrict it to Databricks
         # to ensure loaded scorers can only be executed in controlled environments.
-        if self.kind == ScorerKind.DECORATOR and not is_databricks_uri(get_tracking_uri()):
+        if (
+            self.kind == ScorerKind.DECORATOR
+            and not is_databricks_uri(get_tracking_uri())
+            and not MLFLOW_ENABLE_SERVER_SIDE_CODE_SCORERS.get()
+        ):
             raise MlflowException.invalid_parameter_value(
                 DECORATOR_SCORER_REGISTRATION_NOT_SUPPORTED_ERROR
             )
@@ -1522,6 +1531,64 @@ def scorer(
         description=description,
         aggregations=aggregations,
     )
+
+
+class _SandboxedDecoratorScorer(Scorer):
+    """[POC] A ``@scorer`` code scorer loaded on an OSS backend.
+
+    Its source is never ``exec()``-d in this process. Each call ships the source and the
+    inputs to a sandbox subprocess (see ``mlflow.genai.scorers.sandbox``), so untrusted
+    code cannot run with server privileges. Gated behind
+    ``MLFLOW_ENABLE_SERVER_SIDE_CODE_SCORERS``.
+    """
+
+    _serialized: Any = PrivateAttr(default=None)
+
+    @property
+    def kind(self) -> ScorerKind:
+        return ScorerKind.DECORATOR
+
+    @property
+    def is_session_level_scorer(self) -> bool:
+        return bool(self._serialized and self._serialized.is_session_level_scorer)
+
+    def __call__(
+        self,
+        *,
+        inputs: Any = None,
+        outputs: Any = None,
+        expectations: dict[str, Any] | None = None,
+        trace: Trace | None = None,
+        session: list[Trace] | None = None,
+    ):
+        from mlflow.genai.scorers.sandbox import run_scorer_in_sandbox
+
+        s = self._serialized
+        return run_scorer_in_sandbox(
+            source=s.call_source,
+            signature=s.call_signature,
+            func_name=s.original_func_name,
+            call_kwargs={
+                "inputs": inputs,
+                "outputs": outputs,
+                "expectations": expectations,
+                "trace": trace,
+                "session": session,
+            },
+        )
+
+
+def _make_sandboxed_decorator_scorer(serialized: SerializedScorer) -> Scorer:
+    inst = _SandboxedDecoratorScorer(
+        name=serialized.name,
+        description=serialized.description,
+        aggregations=serialized.aggregations,
+    )
+    # Preserve the original serialized form so re-serialization round-trips unchanged,
+    # and stash it for the sandbox call.
+    object.__setattr__(inst, "_serialized", serialized)
+    object.__setattr__(inst, "_cached_dump", asdict(serialized))
+    return inst
 
 
 class EnsembleScorer(Scorer):

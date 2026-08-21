@@ -1536,6 +1536,33 @@ MLFLOW_SERVER_ENABLE_JOB_EXECUTION = _BooleanEnvironmentVariable(
     "MLFLOW_SERVER_ENABLE_JOB_EXECUTION", True
 )
 
+#: [POC] Job-executor backend selection for the RFC #2 executor framework (vendored from the
+#: jobs-execution-rfc2 branch). ``DEFAULT`` is the backend for ordinary jobs; ``CUSTOM_SCORER``
+#: optionally overrides it for custom (@scorer) code-scorer jobs, so untrusted scorer code can
+#: run in an isolated backend (e.g. ``docker``) while other jobs stay local.
+MLFLOW_JOB_DEFAULT_EXECUTOR_BACKEND = _EnvironmentVariable(
+    "MLFLOW_JOB_DEFAULT_EXECUTOR_BACKEND", str, "local"
+)
+MLFLOW_JOB_CUSTOM_SCORER_EXECUTOR_BACKEND = _EnvironmentVariable(
+    "MLFLOW_JOB_CUSTOM_SCORER_EXECUTOR_BACKEND", str, None
+)
+
+#: [POC] JobExecutorConfig timing knobs for the RFC #2 executor framework.
+MLFLOW_SERVER_JOB_DEFAULT_TIMEOUT = _EnvironmentVariable(
+    "MLFLOW_SERVER_JOB_DEFAULT_TIMEOUT", float, 3600.0
+)
+MLFLOW_SERVER_JOB_LEASE_TTL = _EnvironmentVariable("MLFLOW_SERVER_JOB_LEASE_TTL", float, 60.0)
+MLFLOW_SERVER_COMPLETED_JOB_TTL = _EnvironmentVariable(
+    "MLFLOW_SERVER_COMPLETED_JOB_TTL", float, 86400.0
+)
+
+#: [POC] Docker image for the sandbox containers (job executor + Assistant session pool). The
+#: local mlflow source is bind-mounted at run time, so the image only needs runtime deps.
+#: (default: ``mlflow-scorer-sandbox:poc``)
+MLFLOW_SCORER_SANDBOX_DOCKER_IMAGE = _EnvironmentVariable(
+    "MLFLOW_SCORER_SANDBOX_DOCKER_IMAGE", str, "mlflow-scorer-sandbox:poc"
+)
+
 #: Specifies MLflow server job maximum allowed retries for transient errors.
 #: (default: ``3``)
 MLFLOW_SERVER_JOB_TRANSIENT_ERROR_MAX_RETRIES = _EnvironmentVariable(

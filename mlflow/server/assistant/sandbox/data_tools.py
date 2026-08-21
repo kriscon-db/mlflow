@@ -5,28 +5,31 @@ NOT in the sandbox. Each tool re-checks the caller's RBAC per call, then reads M
 through the EXISTING tracking-store APIs (no parallel data API) and, for bulk reads,
 materializes the results into the caller's network-isolated sandbox workspace for the
 compute tools to analyze.
-
-The set of tools here is the security allow-list: the LLM can only invoke these named,
-RBAC-gated read operations — never arbitrary queries.
 """
 
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
+from mlflow.entities import AssessmentSource, AssessmentSourceType, Feedback
 from mlflow.tracking._tracking_service.utils import _get_store
 
 _logger = logging.getLogger(__name__)
 
-# The data-tool allow-list. Read-only for the POC (writes like log_feedback are deferred).
-SERVER_DATA_TOOLS = {"search_traces", "get_trace"}
+# The data-tool allow-list. Read tools (search_traces/get_trace) plus one write (log_feedback),
+# each RBAC-gated per call. This named set IS the security surface: the LLM can only invoke
+# these operations, never arbitrary store calls.
+SERVER_DATA_TOOLS = {"search_traces", "get_trace", "log_feedback"}
 
 _SEARCH_DEFAULT_MAX = 10
 
 
-def _can_read_experiment(experiment_id: str, caller: str) -> bool:
+def _has_experiment_permission(
+    experiment_id: str | None, caller: str, capability: Literal["can_read", "can_update"]
+) -> bool:
     """Non-raising RBAC check (tools return an error string, not an HTTP 403). Fails open
-    only when the auth plugin isn't installed (no-auth dev server).
+    only when the auth plugin isn't installed (no-auth dev server). ``capability`` selects
+    read (search/get) vs write (log_feedback) enforcement.
     """
     if experiment_id is None:
         return False
@@ -36,7 +39,12 @@ def _can_read_experiment(experiment_id: str, caller: str) -> bool:
         return True
     if not is_auth_enabled():
         return True
-    return _get_experiment_permission(experiment_id, caller).can_read
+    permission = _get_experiment_permission(experiment_id, caller)
+    return permission.can_update if capability == "can_update" else permission.can_read
+
+
+def _can_read_experiment(experiment_id: str, caller: str) -> bool:
+    return _has_experiment_permission(experiment_id, caller, "can_read")
 
 
 def _run_search_traces(
@@ -88,13 +96,46 @@ def _run_get_trace(caller: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
         return "get_trace requires a trace_id.", True
     store = _get_store()
     info = store.get_trace_info(trace_id)
-    experiment_id = info.experiment_id
-    if experiment_id and not _can_read_experiment(experiment_id, caller):
+    # Fail CLOSED: _can_read_experiment returns False for a falsy experiment_id, so a trace with
+    # no experiment is denied rather than returned unchecked (matches the log_feedback path).
+    if not _can_read_experiment(info.experiment_id, caller):
         _logger.warning("data tool: %r denied get_trace on %s", caller, trace_id)
         return f"Permission denied: you cannot read trace {trace_id}.", True
     trace = store.get_trace(trace_id)
     _logger.info("data tool: get_trace %s by %r", trace_id, caller)
     return trace.to_json(), False
+
+
+def _run_log_feedback(caller: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
+    """Attach a feedback assessment to a trace (the one write tool). Gated on the caller's
+    WRITE (can_update) permission on the trace's experiment, and attributed to the caller.
+    """
+    trace_id = tool_input.get("trace_id")
+    if not trace_id:
+        return "log_feedback requires a trace_id.", True
+    if (value := tool_input.get("value")) is None:
+        return "log_feedback requires a value.", True
+
+    store = _get_store()
+    experiment_id = store.get_trace_info(trace_id).experiment_id
+    if not _has_experiment_permission(experiment_id, caller, "can_update"):
+        _logger.warning("data tool: %r denied log_feedback on %s", caller, trace_id)
+        return f"Permission denied: you cannot write to trace {trace_id}.", True
+
+    feedback = Feedback(
+        name=tool_input.get("name") or "feedback",
+        value=value,
+        rationale=tool_input.get("rationale"),
+        trace_id=trace_id,
+        # Attribute to the Assistant, and record which user drove it so the write is auditable.
+        source=AssessmentSource(
+            source_type=AssessmentSourceType.LLM_JUDGE, source_id="mlflow-assistant"
+        ),
+        metadata={"logged_by": caller},
+    )
+    created = store.create_assessment(feedback)
+    _logger.info("data tool: log_feedback %r on %s by %r", feedback.name, trace_id, caller)
+    return json.dumps({"logged": True, "assessment_id": created.assessment_id}), False
 
 
 def run_data_tool(
@@ -109,4 +150,6 @@ def run_data_tool(
         return _run_search_traces(caller, session_id, tool_input, tracking_uri)
     if tool_name == "get_trace":
         return _run_get_trace(caller, tool_input)
+    if tool_name == "log_feedback":
+        return _run_log_feedback(caller, tool_input)
     return f"Unknown data tool: {tool_name}", True

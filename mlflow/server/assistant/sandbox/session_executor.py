@@ -1,10 +1,9 @@
 """[POC] Session executor contract for the sandboxed, multi-user MLflow Assistant.
 
-This is the Track 1 sibling of the job-executor framework (``AbstractJobExecutor``): it
-runs the Assistant's untrusted *compute* tools (bash/read/write/edit) inside a per-session
-sandbox instead of the server process. It rhymes with the job executor (same container
-primitive, same Topology B security: scoped token, Gateway-only LLM, no secrets in the
-sandbox) but has a long-running, interactive lifecycle rather than run-to-completion:
+The interactive sibling of the job-executor framework (``AbstractJobExecutor``): it runs the
+Assistant's untrusted *compute* tools (bash/read/write/edit) inside a per-session sandbox
+instead of the server process. Same container primitive and isolation posture (no secrets in
+the sandbox), but a long-running, interactive lifecycle rather than run-to-completion:
 
   - job executor:     submit_job -> wait_for_job          (one shot)
   - session executor: start_session -> exec_in_session*   (persistent, many turns) -> stop
@@ -76,8 +75,13 @@ class AbstractSessionExecutor(ABC):
         """Destroy the session's sandbox. Sandboxes are never recycled across sessions."""
 
     @abstractmethod
-    def recover_sessions(self, unfinished_session_ids: list[str]) -> list[SessionRecoveryResult]:
-        """Determine recovery action for sessions whose server process disappeared."""
+    def recover_sessions(self, bindings: dict[str, str]) -> list[SessionRecoveryResult]:
+        """Reattach sessions to their sandboxes after the server process restarted.
+
+        ``bindings`` maps ``session_id -> container_id`` (from the persisted session store);
+        warm sandboxes are assigned before they can be labeled, so this authoritative binding —
+        not a backend-side label lookup — is what makes reattach possible.
+        """
 
     @property
     def remote_execution(self) -> bool:

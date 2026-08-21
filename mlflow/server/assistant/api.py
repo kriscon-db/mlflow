@@ -72,6 +72,15 @@ def _resolve_provider(
     selected = _get_selected_provider(config)
     if selected is not None:
         if remote and not selected.allows_remote_access:
+            # Security boundary: the CLI providers (claude_code/codex) execute tools in a host
+            # process, not the per-session sandbox, so they are localhost-only. Returning None
+            # here makes _enforce_remote_access reject the remote request with a 403 rather than
+            # silently running host tools for a remote user.
+            _logger.warning(
+                "assistant provider %r is localhost-only (allows_remote_access=False); "
+                "refusing to serve it to a remote client",
+                selected.name,
+            )
             return None
         return selected
     return resolve_default_provider(remote=remote)
@@ -102,11 +111,34 @@ def _provider_allows_remote_access(provider: AssistantProvider | None) -> bool:
     return MLFLOW_ENABLE_REMOTE_ASSISTANT.get() and provider.allows_remote_access
 
 
+def _auth_enabled() -> bool:
+    """Whether MLflow's auth app is active. Fails closed (returns False) when the auth plugin
+    isn't even installed, so a remote request can't slip through on a misconfigured server.
+    """
+    try:
+        from mlflow.server.auth import is_auth_enabled
+    except ImportError:
+        return False
+    return is_auth_enabled()
+
+
+_REMOTE_REQUIRES_AUTH_ERROR_MSG = (
+    "Remote MLflow Assistant access requires authentication to be enabled, so every request "
+    "has a verified identity to scope its sandbox and data access to. Enable MLflow auth, or "
+    "use the Assistant from the server host."
+)
+
+
 def _enforce_remote_access(request: Request, provider: AssistantProvider | None) -> None:
     if _is_localhost(request):
         return
     if not _provider_allows_remote_access(provider):
         raise HTTPException(status_code=403, detail=_BLOCK_REMOTE_ACCESS_ERROR_MSG)
+    # Without auth, a remote caller resolves to the shared 'remote-anonymous' principal and RBAC
+    # would fail open — so a remote server MUST have auth enabled. Localhost single-user is exempt
+    # (handled by the early return above).
+    if not _auth_enabled():
+        raise HTTPException(status_code=403, detail=_REMOTE_REQUIRES_AUTH_ERROR_MSG)
 
 
 def _resolve_caller_identity(request: Request) -> str:
@@ -660,7 +692,9 @@ async def resolve_client_tool_result(
 
     return MessageResponse(
         session_id=session_id,
-        stream_url=f"/ajax-api/3.0/mlflow/assistant/sessions/{session_id}/stream",
+        stream_url=_add_static_prefix(
+            f"/ajax-api/3.0/mlflow/assistant/sessions/{session_id}/stream"
+        ),
     )
 
 

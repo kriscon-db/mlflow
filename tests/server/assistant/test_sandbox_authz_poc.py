@@ -13,10 +13,18 @@ import pytest
 from fastapi import HTTPException
 
 from mlflow.assistant.config import PermissionsConfig
+from mlflow.assistant.providers import (
+    ClaudeCodeProvider,
+    CodexProvider,
+    MlflowGatewayProvider,
+    OllamaProvider,
+    OpenAICompatibleProvider,
+)
 from mlflow.assistant.providers.tool_executor import execute_tool
 from mlflow.server.assistant.api import (
     _authorize_experiment_access,
     _authorize_session_access,
+    _enforce_remote_access,
     _resolve_caller_identity,
 )
 from mlflow.server.assistant.sandbox.integration import _to_tool_call
@@ -176,21 +184,74 @@ def test_execute_tool_routes_data_tools_to_server_tier(monkeypatch):
 def test_data_tools_advertised_only_when_sandbox_enabled(monkeypatch):
     from mlflow.assistant.providers.tool_executor import build_tools_schema
 
+    data_tools = {"search_traces", "get_trace", "log_feedback"}
     monkeypatch.setenv("MLFLOW_ENABLE_ASSISTANT_SANDBOX", "true")
     names_on = {t["function"]["name"] for t in build_tools_schema()}
-    assert {"search_traces", "get_trace"} <= names_on
+    assert data_tools <= names_on
 
     monkeypatch.setenv("MLFLOW_ENABLE_ASSISTANT_SANDBOX", "false")
     names_off = {t["function"]["name"] for t in build_tools_schema()}
-    assert not ({"search_traces", "get_trace"} & names_off)
+    assert not (data_tools & names_off)
+
+
+def test_gateway_family_is_the_sandbox_capable_family():
+    # Only OpenAICompatibleProvider calls execute_tool (the sandbox routing point). The
+    # gateway/server-loop providers subclass it, so every gateway-backed model — OpenAI,
+    # Anthropic, and Gemini alike — routes its compute tools through the sandbox. There is no
+    # per-model sandbox work: the coverage is structural, via this inheritance.
+    assert issubclass(MlflowGatewayProvider, OpenAICompatibleProvider)
+    assert issubclass(OllamaProvider, OpenAICompatibleProvider)
+
+
+@pytest.mark.parametrize(
+    ("provider_cls", "expected_remote"),
+    [
+        (ClaudeCodeProvider, False),
+        (CodexProvider, False),
+        (MlflowGatewayProvider, True),
+    ],
+)
+def test_cli_providers_are_localhost_only(provider_cls, expected_remote):
+    # Security boundary as a regression test: the CLI providers execute tools in a host process
+    # (not the sandbox), so they must stay localhost-only. If someone flips one to remote, this
+    # fails loudly — because a remote-reachable CLI provider would expose host exec to other users.
+    assert provider_cls().allows_remote_access is expected_remote
+
+
+def test_remote_request_with_localhost_only_provider_is_blocked():
+    remote_request = _request("10.0.0.9")
+    with pytest.raises(HTTPException, match="only accessible") as exc:
+        _enforce_remote_access(remote_request, ClaudeCodeProvider())
+    assert exc.value.status_code == 403
+    # The same provider from localhost is allowed (the gate keys on client IP, not the provider).
+    _enforce_remote_access(_request("127.0.0.1"), ClaudeCodeProvider())
+
+
+def test_remote_access_requires_auth_enabled(monkeypatch):
+    # A remote-capable provider still must not serve remote clients when auth is off: without a
+    # verified identity, RBAC would fail open. Localhost stays exempt.
+    from mlflow.server.assistant import api
+
+    monkeypatch.setenv("MLFLOW_ENABLE_REMOTE_ASSISTANT", "true")
+    remote = _request("10.0.0.9")
+    gateway = MlflowGatewayProvider()
+
+    # auth disabled (base test env has no auth plugin -> _auth_enabled() is False) -> refused
+    with pytest.raises(HTTPException, match="requires authentication") as exc:
+        _enforce_remote_access(remote, gateway)
+    assert exc.value.status_code == 403
+
+    # auth enabled -> the same remote request is allowed
+    with mock.patch.object(api, "_auth_enabled", return_value=True):
+        _enforce_remote_access(remote, gateway)
+
+    # localhost is unaffected even with auth off
+    _enforce_remote_access(_request("127.0.0.1"), gateway)
 
 
 def test_data_tool_rbac_denies_without_read(monkeypatch):
     # The data tier re-checks the caller's experiment permission; a denied caller gets an
     # error result (not the data), even though the tool routing succeeded.
-    import sys
-    import types
-
     from mlflow.server.assistant.sandbox import data_tools
 
     fake_auth = types.ModuleType("mlflow.server.auth")
@@ -202,3 +263,66 @@ def test_data_tool_rbac_denies_without_read(monkeypatch):
         )
     assert is_error
     assert "Permission denied" in out
+
+
+def test_log_feedback_writes_when_caller_has_write_access():
+    from mlflow.server.assistant.sandbox import data_tools
+
+    fake_store = mock.Mock()
+    fake_store.get_trace_info.return_value = types.SimpleNamespace(experiment_id="7")
+    fake_store.create_assessment.return_value = types.SimpleNamespace(assessment_id="a-1")
+    with (
+        mock.patch.object(data_tools, "_get_store", return_value=fake_store),
+        mock.patch.object(data_tools, "_has_experiment_permission", return_value=True) as perm,
+    ):
+        out, is_error = data_tools.run_data_tool(
+            "alice", "s1", "log_feedback", {"trace_id": "tr-1", "value": True, "name": "relevance"}
+        )
+    assert not is_error
+    assert '"logged": true' in out
+    # Write tools must gate on write (can_update), not read.
+    assert perm.call_args.args == ("7", "alice", "can_update")
+    feedback = fake_store.create_assessment.call_args.args[0]
+    assert feedback.trace_id == "tr-1"
+    assert feedback.metadata == {"logged_by": "alice"}
+
+
+def test_log_feedback_denied_without_write_access():
+    from mlflow.server.assistant.sandbox import data_tools
+
+    fake_store = mock.Mock()
+    fake_store.get_trace_info.return_value = types.SimpleNamespace(experiment_id="7")
+    with (
+        mock.patch.object(data_tools, "_get_store", return_value=fake_store),
+        mock.patch.object(data_tools, "_has_experiment_permission", return_value=False),
+    ):
+        out, is_error = data_tools.run_data_tool(
+            "mallory", "s1", "log_feedback", {"trace_id": "tr-1", "value": True}
+        )
+    assert is_error
+    assert "Permission denied" in out
+    fake_store.create_assessment.assert_not_called()
+
+
+def test_get_trace_fails_closed_when_trace_has_no_experiment():
+    # A trace with no experiment_id must be DENIED, not returned unchecked: _can_read_experiment
+    # returns False for a falsy experiment_id, so get_trace never runs. (Regression for the
+    # earlier fail-open bug where `if experiment_id and not _can_read_experiment(...)` skipped
+    # the check entirely.)
+    from mlflow.server.assistant.sandbox import data_tools
+
+    fake_store = mock.Mock()
+    fake_store.get_trace_info.return_value = types.SimpleNamespace(experiment_id=None)
+    with mock.patch.object(data_tools, "_get_store", return_value=fake_store):
+        out, is_error = data_tools.run_data_tool("alice", "s1", "get_trace", {"trace_id": "tr-1"})
+    assert is_error
+    assert "Permission denied" in out
+    fake_store.get_trace.assert_not_called()
+
+
+def test_log_feedback_requires_value():
+    from mlflow.server.assistant.sandbox import data_tools
+
+    out, is_error = data_tools.run_data_tool("alice", "s1", "log_feedback", {"trace_id": "tr-1"})
+    assert is_error
+    assert "requires a value" in out

@@ -599,6 +599,9 @@ def test_message_allowed_for_remote_client_when_provider_allows_remote_access(mo
         patch("mlflow.server.assistant.api.list_providers", return_value=[mock_provider]),
         patch("mlflow.server.assistant.api._get_selected_provider", return_value=mock_provider),
         patch("mlflow.server.assistant.api._is_localhost", return_value=False),
+        # Remote access now also requires auth to be enabled (so requests have a verified
+        # identity to scope RBAC to); this test exercises the provider-allows-remote path.
+        patch("mlflow.server.assistant.api._auth_enabled", return_value=True),
     ):
         client = TestClient(app)
         response = client.post(

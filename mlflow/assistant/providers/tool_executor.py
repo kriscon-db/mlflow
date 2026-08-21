@@ -18,7 +18,7 @@ _ALLOWED_BASH_COMMANDS = {"mlflow", "python3", "python"}
 _SANDBOX_TOOLS = {"Bash", "Read", "Write", "Edit"}
 # Server-side data tools (the data tier): run in the server under the caller's RBAC and
 # materialize results into the sandbox. Names mirror mlflow.server.assistant.sandbox.data_tools.
-_SERVER_DATA_TOOLS = {"search_traces", "get_trace"}
+_SERVER_DATA_TOOLS = {"search_traces", "get_trace", "log_feedback"}
 
 # Tools executed on the CLIENT (browser), not the server: the assistant loop pauses the turn and
 # waits for a client-submitted result instead of routing the call through execute_tool/the static
@@ -109,12 +109,10 @@ async def execute_tool(
             _logger.exception("data tool failed for %s", tool_name)
             return f"Data tool failed: {e}", True
 
-    # When the Assistant sandbox is enabled, compute tools run inside the session's isolated
-    # container instead of the server process. Isolation is the safety boundary, so the static
-    # host-permission gate (workspace confinement, allow-listed commands) is bypassed here.
-    # Only the server-loop providers (openai_compatible / mlflow_gateway) reach this path with a
-    # session_id; the CLI providers (claude_code, codex) run their own host process and are
-    # localhost-only (allows_remote_access=False), so they never expose host exec to remote users.
+    # With the sandbox enabled, compute tools run in the session's isolated container, so the
+    # static host-permission gate is bypassed here — isolation is the boundary. Only the
+    # server-loop providers reach this with a session_id; the CLI providers run their own host
+    # process and are localhost-only, so they never expose host exec to a remote user.
     if session_id and MLFLOW_ENABLE_ASSISTANT_SANDBOX.get() and tool_name in _SANDBOX_TOOLS:
         from mlflow.server.assistant.sandbox.integration import run_sandboxed_tool
 
@@ -393,6 +391,37 @@ _DATA_TOOL_SCHEMAS = [
                     "trace_id": {"type": "string", "description": "The trace ID to fetch."},
                 },
                 "required": ["trace_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_feedback",
+            "description": (
+                "Attach a feedback assessment (a named score/label with an optional rationale) "
+                "to a trace. Requires write access to the trace's experiment."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "trace_id": {
+                        "type": "string",
+                        "description": "The trace to attach feedback to.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Feedback name, e.g. 'relevance' (default 'feedback').",
+                    },
+                    "value": {
+                        "description": "The feedback value: bool, number, string, list, or object.",
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Optional justification for the feedback.",
+                    },
+                },
+                "required": ["trace_id", "value"],
             },
         },
     },

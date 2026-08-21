@@ -1,13 +1,14 @@
 """[POC] Run a ``@scorer`` code scorer's source in an isolated sandbox.
 
-This is the Project Delight sandbox seam. It exposes one entry point,
-``run_scorer_in_sandbox``, backed by a pluggable provider selected via
+One entry point, ``run_scorer_in_sandbox``, backed by a provider selected via
 ``MLFLOW_SCORER_SANDBOX_PROVIDER``:
 
 - ``subprocess`` (default): a scrubbed-env child process with a CPU limit and a wall-clock
   timeout. Portable, no infra, but does NOT confine filesystem reads or network egress.
-- ``docker``: a locked-down ``docker run`` (``--network none``, resource limits, non-root,
-  read-only rootfs). Real fs + network isolation. Requires a running docker daemon.
+- ``docker``: runs the scorer AS a job on the RFC #2 job-executor substrate
+  (``DockerJobExecutor``, obtained from the vendored executor registry). The scorer source
+  executes inside a locked-down container (``--network none``, resource limits, non-root,
+  read-only rootfs) — the container IS the sandbox. Requires a running docker daemon.
 
 Either way the scorer's source is NEVER ``exec()``-d in the server/worker process — the
 source + inputs are shipped to ``_sandbox_runner``, which runs inside the sandbox.
@@ -19,44 +20,46 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
-import mlflow
-from mlflow.entities import Feedback
+from mlflow.entities import AssessmentError, Feedback
+from mlflow.environment_variables import MLFLOW_SCORER_SANDBOX_PROVIDER
 from mlflow.exceptions import MlflowException
 from mlflow.utils.os import is_windows
 
 _logger = logging.getLogger(__name__)
 
-_SECRET_SUBSTRINGS = ("TOKEN", "SECRET", "PASSWORD", "APIKEY", "API_KEY", "CREDENTIAL")
-_SECRET_PREFIXES = (
-    "MLFLOW_TRACKING_",
-    "DATABRICKS",
-    "AWS_",
-    "AZURE_",
-    "GOOGLE_",
-    "GCP_",
-    "OPENAI",
-    "ANTHROPIC",
-)
+# Only these env vars reach the subprocess sandbox; everything else (including any
+# credential-bearing var) is dropped. HOME/PYTHONPATH are set explicitly in _scrubbed_env.
+_ENV_ALLOWLIST = frozenset({
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_NUMERIC",
+    "TZ",
+    "TERM",
+    # Windows essentials for launching the Python interpreter.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "PATHEXT",
+    "NUMBER_OF_PROCESSORS",
+    "TEMP",
+    "TMP",
+})
 
 _CPU_SECONDS = 30
 _WALL_TIMEOUT_SECONDS = 120
-_MEMORY = "1g"
-_PIDS_LIMIT = "256"
-_DEFAULT_DOCKER_IMAGE = "mlflow-scorer-sandbox:poc"
 _RUNNER_MODULE = "mlflow.genai.scorers._sandbox_runner"
 
 
 # --------------------------------------------------------------------------------------
 # Payload / result plumbing (backend-agnostic)
 # --------------------------------------------------------------------------------------
-def _is_secret_env(name: str) -> bool:
-    upper = name.upper()
-    return upper.startswith(_SECRET_PREFIXES) or any(s in upper for s in _SECRET_SUBSTRINGS)
-
-
 def _serialize_trace(trace: Any) -> Any:
     if trace is None:
         return None
@@ -83,16 +86,22 @@ def _json_safe_kwargs(call_kwargs: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in safe.items() if v is not None}
 
 
+def _feedback_from_dict(v: dict[str, Any]) -> Feedback:
+    error = v.get("error")
+    return Feedback(
+        name=v.get("name"),
+        value=v.get("value"),
+        rationale=v.get("rationale"),
+        error=AssessmentError(**error) if error else None,
+    )
+
+
 def _deserialize_result(result: dict[str, Any]) -> Any:
     kind = result["kind"]
     if kind == "feedback":
-        v = result["value"]
-        return Feedback(name=v.get("name"), value=v.get("value"), rationale=v.get("rationale"))
+        return _feedback_from_dict(result["value"])
     if kind == "feedback_list":
-        return [
-            Feedback(name=v.get("name"), value=v.get("value"), rationale=v.get("rationale"))
-            for v in result["value"]
-        ]
+        return [_feedback_from_dict(v) for v in result["value"]]
     return result["value"]
 
 
@@ -100,10 +109,9 @@ def _deserialize_result(result: dict[str, Any]) -> Any:
 # Provider: subprocess (default, portable, no infra)
 # --------------------------------------------------------------------------------------
 def _scrubbed_env(workdir: Path) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not _is_secret_env(k)}
+    env = {k: v for k, v in os.environ.items() if k in _ENV_ALLOWLIST}
     env["HOME"] = str(workdir)
     env["PYTHONPATH"] = os.pathsep.join(sys.path)
-    env.pop("MLFLOW_TRACKING_URI", None)
     return env
 
 
@@ -131,100 +139,60 @@ def _run_subprocess(workdir: Path, func_name: str) -> None:
     _require_result(workdir, func_name, proc.returncode, proc.stderr)
 
 
-# --------------------------------------------------------------------------------------
-# Provider: docker (real fs + network isolation; requires a running daemon)
-# --------------------------------------------------------------------------------------
-def _docker_image() -> str:
-    return os.environ.get("MLFLOW_SCORER_SANDBOX_DOCKER_IMAGE", _DEFAULT_DOCKER_IMAGE)
+# Provider: docker. Runs the scorer as a job on DockerJobExecutor (from the vendored RFC #2
+# registry, so a Kubernetes backend can slot in later) — the hardened container is the sandbox.
+_SCORER_JOB_FN = "mlflow.genai.scorers._sandbox_runner.run_scorer_job"
+
+_job_executor = None
+_job_executor_lock = threading.Lock()
 
 
-def _ensure_docker_image(image: str) -> None:
-    """Build the sandbox base image on first use if it isn't present.
-
-    The image only needs mlflow's runtime dependencies installed; the actual mlflow
-    package (including the new runner) is bind-mounted from the local source at run time,
-    so the container always runs this branch's code regardless of the image's mlflow.
+def _get_scorer_job_executor():
+    """Return a ``DockerJobExecutor`` registered under the "docker" backend of a
+    ``JobExecutorRegistry`` (the RFC #2 selection seam).
     """
-    inspect = subprocess.run(["docker", "image", "inspect", image], capture_output=True, text=True)
-    if inspect.returncode == 0:
-        return
-    with tempfile.TemporaryDirectory(prefix="mlflow-sandbox-image-") as ctx:
-        dockerfile = (
-            "FROM python:3.11-slim\n"
-            # Honor a host-provided pip index (e.g. an internal proxy behind a VPN that
-            # blackholes pypi.org). Empty by default, so plain PyPI is used elsewhere.
-            "ARG PIP_INDEX_URL=\n"
-            "ARG PIP_EXTRA_INDEX_URL=\n"
-            "ENV PIP_INDEX_URL=$PIP_INDEX_URL PIP_EXTRA_INDEX_URL=$PIP_EXTRA_INDEX_URL\n"
-            # Runtime deps only; mlflow source is mounted at run time.
-            "RUN pip install --no-cache-dir mlflow\n"
-        )
-        Path(ctx, "Dockerfile").write_text(dockerfile)
-        # --load so the buildx (docker-container driver) result lands in the local image
-        # store rather than only the build cache.
-        build_cmd = ["docker", "build", "--load", "-t", image]
-        for arg in ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"):
-            if os.environ.get(arg):
-                build_cmd += ["--build-arg", f"{arg}={os.environ[arg]}"]
-        build_cmd.append(ctx)
-        build = subprocess.run(
-            build_cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        if build.returncode != 0:
-            raise MlflowException(
-                f"Failed to build sandbox image '{image}':\n{build.stderr[-2000:]}"
-            )
+    global _job_executor
+    from mlflow.server.jobs.docker_executor import DockerJobExecutor
+    from mlflow.server.jobs.executor import JobExecutorConfig
+    from mlflow.server.jobs.executor_registry import JobExecutorRegistry
+
+    with _job_executor_lock:
+        if _job_executor is None:
+            registry = JobExecutorRegistry(JobExecutorConfig())
+            executor = DockerJobExecutor(registry.config)
+            executor.start_executor()
+            registry.register("docker", executor)
+            _job_executor = registry.get("docker")
+        return _job_executor
 
 
 def _run_docker(workdir: Path, func_name: str) -> None:
-    image = _docker_image()
-    _ensure_docker_image(image)
-    mlflow_pkg = Path(mlflow.__file__).resolve().parent  # .../mlflow
-    cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "--memory",
-        _MEMORY,
-        "--memory-swap",
-        _MEMORY,
-        "--pids-limit",
-        _PIDS_LIMIT,
-        "--cpus",
-        "1",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--read-only",
-        "--tmpfs",
-        "/tmp",
-        # Run as the host user so the bind-mounted workdir stays writable for result.json.
-        "--user",
-        f"{os.getuid()}:{os.getgid()}",
-        "-v",
-        f"{workdir}:/sandbox",
-        "-v",
-        f"{mlflow_pkg}:/mlflow-src/mlflow:ro",
-        "-e",
-        "PYTHONPATH=/mlflow-src",
-        "-e",
-        "HOME=/sandbox",
-        "-w",
-        "/sandbox",
-        image,
-        "python",
-        "-m",
-        _RUNNER_MODULE,
-        "/sandbox",
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_WALL_TIMEOUT_SECONDS)
-    _require_result(workdir, func_name, proc.returncode, proc.stderr)
+    from mlflow.entities._job_status import JobStatus
+    from mlflow.server.jobs.executor import JobExecutionContext
+
+    executor = _get_scorer_job_executor()
+    payload = json.loads((workdir / "payload.json").read_text())
+    job_id = uuid.uuid4().hex
+    executor.submit_job(
+        job_id=job_id,
+        job_name="scorer_sandbox",
+        fn_fullname=_SCORER_JOB_FN,
+        params={"payload": payload},
+        context=JobExecutionContext(job_id=job_id, tracking_uri=""),
+        timeout=_WALL_TIMEOUT_SECONDS,
+    )
+    result = executor.wait_for_job(job_id)
+    # JobResult.result is the JSON text of run_scorer_job's envelope ({"ok", "result"}); write
+    # it straight to result.json for run_scorer_in_sandbox. A crashed container yields a
+    # non-SUCCEEDED status with no result -> _require_result raises with the executor's message.
+    if result.status == JobStatus.SUCCEEDED and result.result is not None:
+        (workdir / "result.json").write_text(result.result)
+    _require_result(
+        workdir,
+        func_name,
+        0 if result.status == JobStatus.SUCCEEDED else 1,
+        result.error_message or "",
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -233,6 +201,18 @@ def _run_docker(workdir: Path, func_name: str) -> None:
 _PROVIDERS = {"subprocess": _run_subprocess, "docker": _run_docker}
 
 _subprocess_isolation_warned = False
+
+
+def _auth_enabled() -> bool:
+    """Whether MLflow's auth app is active (i.e. a multi-user server). Fails safe to False when
+    the auth plugin isn't installed (localhost/dev), so single-user dev keeps the subprocess
+    provider.
+    """
+    try:
+        from mlflow.server.auth import is_auth_enabled
+    except ImportError:
+        return False
+    return is_auth_enabled()
 
 
 def _warn_subprocess_isolation_once() -> None:
@@ -264,13 +244,22 @@ def run_scorer_in_sandbox(
     Returns the scorer's result (primitive, ``Feedback``, or ``list[Feedback]``).
     Raises ``MlflowException`` if the sandbox cannot run or the scorer raises.
     """
-    provider_name = os.environ.get("MLFLOW_SCORER_SANDBOX_PROVIDER", "subprocess")
+    provider_name = MLFLOW_SCORER_SANDBOX_PROVIDER.get()
     provider = _PROVIDERS.get(provider_name)
     if provider is None:
         raise MlflowException.invalid_parameter_value(
             f"Unknown sandbox provider '{provider_name}'. Valid: {sorted(_PROVIDERS)}."
         )
     if provider_name == "subprocess":
+        # The subprocess provider does not confine filesystem or network access, so on an
+        # auth-enabled (multi-user) server it would let one user's scorer code read another
+        # tenant's on-disk credentials / reach the network. Refuse it there — require docker.
+        if _auth_enabled():
+            raise MlflowException(
+                "The 'subprocess' scorer sandbox provider does not isolate filesystem or "
+                "network access and is not permitted on an auth-enabled server. Set "
+                "MLFLOW_SCORER_SANDBOX_PROVIDER=docker."
+            )
         _warn_subprocess_isolation_once()
 
     with tempfile.TemporaryDirectory(prefix="mlflow-scorer-sandbox-") as tmp:

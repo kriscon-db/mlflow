@@ -674,8 +674,8 @@ class Scorer(BaseModel):
         # registration is gated behind authentication. OSS backends don't have this guarantee,
         # so block loading to prevent executing untrusted code.
         if not is_databricks_uri(get_tracking_uri()):
-            # [POC] Delight: when the operator opts in, don't exec the source in this process.
-            # Return a scorer whose calls ship the source to a sandbox subprocess instead.
+            # [POC] When the operator opts in, don't exec the source in this process; return a
+            # scorer whose calls ship the source to an isolated sandbox instead.
             if MLFLOW_ENABLE_SERVER_SIDE_CODE_SCORERS.get():
                 return _make_sandboxed_decorator_scorer(serialized)
             code_snippet = (

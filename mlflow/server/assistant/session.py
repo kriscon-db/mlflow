@@ -208,6 +208,52 @@ class SessionManager:
         return Session(context=context or {}, working_dir=working_dir, owner=owner)
 
 
+def get_container_file(session_id: str) -> Path:
+    """Path of the session's sandbox-binding sidecar."""
+    SessionManager.validate_session_id(session_id)
+    return SESSION_DIR / f"{session_id}.container.json"
+
+
+def save_container_binding(session_id: str, container_id: str, node_id: str) -> None:
+    """Record the session's sandbox container in a sidecar file, so it can be reattached after
+    a server restart. A sidecar (not a Session field) because the Session record is owned and
+    rewritten by the request handler each turn, which would clobber a mid-turn field write; the
+    sidecar is independent of that save path (same pattern as the PID sidecar below).
+    """
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    get_container_file(session_id).write_text(
+        json.dumps({"container_id": container_id, "node_id": node_id})
+    )
+
+
+def clear_container_binding(session_id: str) -> None:
+    try:
+        container_file = get_container_file(session_id)
+    except ValueError:
+        return
+    container_file.unlink(missing_ok=True)
+
+
+def list_container_bindings() -> dict[str, tuple[str, str | None]]:
+    """``{session_id: (container_id, node_id)}`` for every session with a sandbox sidecar.
+    Used on server startup to reattach live sandboxes and reap orphans.
+    """
+    if not SESSION_DIR.exists():
+        return {}
+    bindings: dict[str, tuple[str, str | None]] = {}
+    for path in SESSION_DIR.glob("*.container.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if container_id := data.get("container_id"):
+            bindings[path.name.removesuffix(".container.json")] = (
+                container_id,
+                data.get("node_id"),
+            )
+    return bindings
+
+
 def get_process_file(session_id: str) -> Path:
     """Get the file path for storing process PID."""
     SessionManager.validate_session_id(session_id)

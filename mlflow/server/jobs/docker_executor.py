@@ -23,6 +23,7 @@ from typing import Any
 
 import mlflow
 from mlflow.entities._job_status import JobStatus
+from mlflow.environment_variables import MLFLOW_SCORER_SANDBOX_DOCKER_IMAGE
 from mlflow.exceptions import MlflowException
 from mlflow.server.jobs.executor import (
     AbstractJobExecutor,
@@ -34,7 +35,6 @@ from mlflow.utils.environment import _PythonEnv
 
 _logger = logging.getLogger(__name__)
 
-_IMAGE = os.environ.get("MLFLOW_SCORER_SANDBOX_DOCKER_IMAGE", "mlflow-scorer-sandbox:poc")
 _ENTRY_MODULE = "mlflow.server.jobs._docker_job_entry"
 _LABEL_JOB_ID = "mlflow.job_id"
 _LABEL_JOB_NAME = "mlflow.job_name"
@@ -43,10 +43,16 @@ _NANO_CPUS = 1_000_000_000
 _PIDS_LIMIT = 256
 
 
+def _image() -> str:
+    """Sandbox image name (read inside a function so tests/consumers can override the env var)."""
+    return MLFLOW_SCORER_SANDBOX_DOCKER_IMAGE.get()
+
+
 @dataclass
 class _RunningJob:
     container_id: str
     workdir: Path
+    timeout: float | None = None
 
 
 class DockerJobExecutor(AbstractJobExecutor):
@@ -92,7 +98,7 @@ class DockerJobExecutor(AbstractJobExecutor):
 
         client = self._get_client()
         try:
-            client.images.get(_IMAGE)
+            client.images.get(_image())
             return
         except docker.errors.ImageNotFound:
             pass
@@ -108,7 +114,7 @@ class DockerJobExecutor(AbstractJobExecutor):
         )
         with tempfile.TemporaryDirectory(prefix="mlflow-sandbox-image-") as ctx:
             Path(ctx, "Dockerfile").write_text(dockerfile)
-            client.images.build(path=ctx, tag=_IMAGE, buildargs=buildargs, rm=True)
+            client.images.build(path=ctx, tag=_image(), buildargs=buildargs, rm=True)
 
     def _job_env(self, context: JobExecutionContext) -> dict[str, str]:
         env = {
@@ -148,7 +154,7 @@ class DockerJobExecutor(AbstractJobExecutor):
         # container can POST its result back (operator egress policy would allowlist this).
         callback = self._result_callback_url is not None
         container = client.containers.run(
-            _IMAGE,
+            _image(),
             command=["python", "-m", _ENTRY_MODULE, "/sandbox"],
             detach=True,
             labels={_LABEL_JOB_ID: job_id, _LABEL_JOB_NAME: job_name},
@@ -170,7 +176,9 @@ class DockerJobExecutor(AbstractJobExecutor):
                 str(mlflow_pkg): {"bind": "/mlflow-src/mlflow", "mode": "ro"},
             },
         )
-        self._jobs[job_id] = _RunningJob(container_id=container.id, workdir=workdir)
+        self._jobs[job_id] = _RunningJob(
+            container_id=container.id, workdir=workdir, timeout=timeout
+        )
         _logger.info(
             "docker job %s submitted (%s, container %s)", job_id, fn_fullname, container.short_id
         )
@@ -185,7 +193,12 @@ class DockerJobExecutor(AbstractJobExecutor):
         # disk-full mid-write) would leak the container and temp dir.
         try:
             try:
-                outcome = container.wait(timeout=self._config.default_timeout)
+                # Honor the per-job timeout passed to submit_job; fall back to the framework
+                # default only when the job did not specify one.
+                wait_timeout = (
+                    rec.timeout if rec.timeout is not None else self._config.default_timeout
+                )
+                outcome = container.wait(timeout=wait_timeout)
             except Exception as e:
                 return JobResult(
                     status=JobStatus.TIMEOUT, error_message=str(e), is_transient_error=True

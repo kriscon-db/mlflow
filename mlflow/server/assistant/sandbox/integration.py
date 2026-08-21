@@ -10,8 +10,21 @@ import logging
 import threading
 from typing import Any
 
-from mlflow.server.assistant.sandbox.docker_session_executor import DockerSessionExecutor
+from mlflow.environment_variables import (
+    MLFLOW_ASSISTANT_SANDBOX_IDLE_TTL,
+    MLFLOW_ASSISTANT_SANDBOX_MAX_TOTAL,
+    MLFLOW_ASSISTANT_SANDBOX_MIN_IDLE,
+)
+from mlflow.server.assistant.sandbox.docker_session_executor import (
+    DockerSessionExecutor,
+    get_node_id,
+)
 from mlflow.server.assistant.sandbox.session_executor import SessionContext, ToolCall
+from mlflow.server.assistant.session import (
+    clear_container_binding,
+    list_container_bindings,
+    save_container_binding,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -23,12 +36,30 @@ _executor: DockerSessionExecutor | None = None
 _lock = threading.Lock()
 
 
+def _recover_bindings() -> dict[str, str]:
+    """Session -> container bindings this node should reattach after a restart.
+
+    Reads the persisted session store and keeps only bindings owned by this node (a container
+    on another host is unreachable from here). Anything not returned here that is still running
+    gets reaped as an orphan by the executor.
+    """
+    return {
+        session_id: container_id
+        for session_id, (container_id, node_id) in list_container_bindings().items()
+        if node_id == get_node_id() and container_id
+    }
+
+
 def _get_executor() -> DockerSessionExecutor:
     global _executor
     with _lock:
         if _executor is None:
-            executor = DockerSessionExecutor()
-            executor.start_executor()
+            executor = DockerSessionExecutor(
+                min_idle=MLFLOW_ASSISTANT_SANDBOX_MIN_IDLE.get(),
+                max_total=MLFLOW_ASSISTANT_SANDBOX_MAX_TOTAL.get(),
+                idle_ttl=MLFLOW_ASSISTANT_SANDBOX_IDLE_TTL.get(),
+            )
+            executor.start_executor(recover_bindings=_recover_bindings())
             _executor = executor
         return _executor
 
@@ -67,7 +98,16 @@ def _ensure_session(executor, session_id, tracking_uri, owner=None):
         executor.start_session(
             SessionContext(session_id=session_id, tracking_uri=tracking_uri or "", owner=owner)
         )
+        _persist_binding(executor, session_id)
     return notice
+
+
+def _persist_binding(executor, session_id: str) -> None:
+    """Record the session's assigned container (in a sidecar file) so the sandbox can be
+    reattached after a server restart.
+    """
+    if container_id := executor.get_container_id(session_id):
+        save_container_binding(session_id, container_id, get_node_id())
 
 
 def run_sandboxed_tool(
@@ -110,3 +150,6 @@ def stop_sandbox_session(session_id: str) -> None:
     """Tear down a session's sandbox (called when the Assistant session ends/cancels)."""
     if _executor is not None:
         _executor.stop_session(session_id)
+    # Clear the persisted binding: the container is gone, so a later restart must not try to
+    # reattach it (or tombstone a session the user deliberately ended).
+    clear_container_binding(session_id)

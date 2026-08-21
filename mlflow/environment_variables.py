@@ -124,6 +124,56 @@ MLFLOW_ENABLE_REMOTE_ASSISTANT = _BooleanEnvironmentVariable(
     "MLFLOW_ENABLE_REMOTE_ASSISTANT", False
 )
 
+#: [POC] Opt-in flag that lets OSS (non-Databricks) backends register and run custom
+#: ``@scorer`` code scorers by executing their source in a sandbox instead of the
+#: server/worker process. Off by default because it lifts the RCE-protection gate.
+#: NOTE: the isolation strength depends on ``MLFLOW_SCORER_SANDBOX_PROVIDER``. The default
+#: ``subprocess`` provider scrubs env vars and caps CPU/wall-time but does NOT confine
+#: filesystem reads or network egress; only the ``docker`` provider isolates fs + network.
+#: (default: ``False``)
+MLFLOW_ENABLE_SERVER_SIDE_CODE_SCORERS = _BooleanEnvironmentVariable(
+    "MLFLOW_ENABLE_SERVER_SIDE_CODE_SCORERS", False
+)
+
+#: [POC] Opt-in flag that runs the MLflow Assistant's compute tools (Bash/Read/Write/Edit)
+#: inside a per-session Docker sandbox instead of the server process, so the Assistant can
+#: be exposed to remote/multi-user servers without executing untrusted tool calls on the host.
+#: (default: ``False``)
+MLFLOW_ENABLE_ASSISTANT_SANDBOX = _BooleanEnvironmentVariable(
+    "MLFLOW_ENABLE_ASSISTANT_SANDBOX", False
+)
+
+#: [POC] Warm-pool sizing for the Assistant session sandbox. ``MIN_IDLE`` pre-warmed
+#: containers are kept ready; the pool never exceeds ``MAX_TOTAL`` (idle + active); an active
+#: session's sandbox is reaped after ``IDLE_TTL`` seconds of inactivity.
+MLFLOW_ASSISTANT_SANDBOX_MIN_IDLE = _EnvironmentVariable(
+    "MLFLOW_ASSISTANT_SANDBOX_MIN_IDLE", int, 2
+)
+MLFLOW_ASSISTANT_SANDBOX_MAX_TOTAL = _EnvironmentVariable(
+    "MLFLOW_ASSISTANT_SANDBOX_MAX_TOTAL", int, 8
+)
+MLFLOW_ASSISTANT_SANDBOX_IDLE_TTL = _EnvironmentVariable(
+    "MLFLOW_ASSISTANT_SANDBOX_IDLE_TTL", float, 900.0
+)
+
+#: [POC] Sandbox provider for server-side code scorers: ``subprocess`` (portable, no fs/network
+#: confinement) or ``docker`` (runs the scorer as a hardened job — real isolation). Refused on
+#: an auth-enabled server (only ``docker`` is permitted there). (default: ``subprocess``)
+MLFLOW_SCORER_SANDBOX_PROVIDER = _EnvironmentVariable(
+    "MLFLOW_SCORER_SANDBOX_PROVIDER", str, "subprocess"
+)
+
+#: [POC] Docker image used for the sandbox containers (scorer job executor + Assistant session
+#: pool). The local mlflow source is bind-mounted at run time, so the image only needs runtime
+#: deps. (default: ``mlflow-scorer-sandbox:poc``)
+MLFLOW_SCORER_SANDBOX_DOCKER_IMAGE = _EnvironmentVariable(
+    "MLFLOW_SCORER_SANDBOX_DOCKER_IMAGE", str, "mlflow-scorer-sandbox:poc"
+)
+
+#: [POC] Node/replica identity that owns this server's sandbox containers. Used to scope
+#: container reattach and orphan reaping to this replica. Defaults to the hostname when unset.
+MLFLOW_ASSISTANT_NODE_ID = _EnvironmentVariable("MLFLOW_ASSISTANT_NODE_ID", str, None)
+
 #: When true, newly created workspaces are seeded with two default RBAC roles
 #: (``admin``, ``user``) that super-admins can assign to other
 #: users. ``CreateWorkspace`` is gated to super-admins, whose ``is_admin`` flag already
@@ -1534,6 +1584,26 @@ MLFLOW_ENFORCE_STDIN_SCORING_SERVER_FOR_SPARK_UDF = _BooleanEnvironmentVariable(
 #: (default: ``True``)
 MLFLOW_SERVER_ENABLE_JOB_EXECUTION = _BooleanEnvironmentVariable(
     "MLFLOW_SERVER_ENABLE_JOB_EXECUTION", True
+)
+
+#: [POC] Job-executor backend selection for the RFC #2 executor framework (vendored from the
+#: jobs-execution-rfc2 branch). ``DEFAULT`` is the backend for ordinary jobs; ``CUSTOM_SCORER``
+#: optionally overrides it for custom (@scorer) code-scorer jobs, so untrusted scorer code can
+#: run in an isolated backend (e.g. ``docker``) while other jobs stay local.
+MLFLOW_JOB_DEFAULT_EXECUTOR_BACKEND = _EnvironmentVariable(
+    "MLFLOW_JOB_DEFAULT_EXECUTOR_BACKEND", str, "local"
+)
+MLFLOW_JOB_CUSTOM_SCORER_EXECUTOR_BACKEND = _EnvironmentVariable(
+    "MLFLOW_JOB_CUSTOM_SCORER_EXECUTOR_BACKEND", str, None
+)
+
+#: [POC] JobExecutorConfig timing knobs for the RFC #2 executor framework.
+MLFLOW_SERVER_JOB_DEFAULT_TIMEOUT = _EnvironmentVariable(
+    "MLFLOW_SERVER_JOB_DEFAULT_TIMEOUT", float, 3600.0
+)
+MLFLOW_SERVER_JOB_LEASE_TTL = _EnvironmentVariable("MLFLOW_SERVER_JOB_LEASE_TTL", float, 60.0)
+MLFLOW_SERVER_COMPLETED_JOB_TTL = _EnvironmentVariable(
+    "MLFLOW_SERVER_COMPLETED_JOB_TTL", float, 86400.0
 )
 
 #: Specifies MLflow server job maximum allowed retries for transient errors.

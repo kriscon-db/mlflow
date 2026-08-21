@@ -124,6 +124,7 @@ class CodexProvider(AssistantProvider):
         mlflow_session_id: str | None = None,
         cwd: Path | None = None,
         context: dict[str, Any] | None = None,
+        caller: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         codex_path = shutil.which(_CODEX_BINARY)
         if not codex_path:

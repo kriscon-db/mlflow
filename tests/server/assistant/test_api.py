@@ -78,6 +78,7 @@ class MockProvider(AssistantProvider):
         mlflow_session_id: str | None = None,
         cwd: Path | None = None,
         context: dict[str, Any] | None = None,
+        caller: str | None = None,
     ):
         yield Event.from_message(message=Message(role="user", content="Hello from mock"))
         yield Event.from_result(result="complete", session_id="mock-session-123")
@@ -598,6 +599,9 @@ def test_message_allowed_for_remote_client_when_provider_allows_remote_access(mo
         patch("mlflow.server.assistant.api.list_providers", return_value=[mock_provider]),
         patch("mlflow.server.assistant.api._get_selected_provider", return_value=mock_provider),
         patch("mlflow.server.assistant.api._is_localhost", return_value=False),
+        # Remote access now also requires auth to be enabled (so requests have a verified
+        # identity to scope RBAC to); this test exercises the provider-allows-remote path.
+        patch("mlflow.server.assistant.api._auth_enabled", return_value=True),
     ):
         client = TestClient(app)
         response = client.post(
@@ -870,6 +874,7 @@ class _DeferredProvider(MockProvider):
         mlflow_session_id=None,
         cwd=None,
         context=None,
+        caller=None,
     ):
         decisions = (context or {}).get("tool_decisions") or {}
         if not decisions:
@@ -916,7 +921,7 @@ async def test_stream_pauses_then_resumes(decision, expected_text):
 
     # Deliver the decision, then a fresh stream resumes to completion.
     res = await resolve_permission(
-        session_id, PermissionDecision(request_id="t1", decision=decision)
+        session_id, PermissionDecision(request_id="t1", decision=decision), mock_request
     )
     assert res.session_id == session_id
 
@@ -941,6 +946,7 @@ class _CaptureProvider(MockProvider):
         mlflow_session_id=None,
         cwd=None,
         context=None,
+        caller=None,
     ):
         self.captured = {"prompt": prompt, "tracking_uri": tracking_uri, "context": context or {}}
         yield Event.from_result(result=None, session_id="prov-done")
@@ -958,6 +964,7 @@ class _ErrorThenCaptureProvider(MockProvider):
         mlflow_session_id=None,
         cwd=None,
         context=None,
+        caller=None,
     ):
         self.session_ids.append(session_id)
         if len(self.session_ids) == 1:

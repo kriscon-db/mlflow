@@ -21,6 +21,10 @@ class Session:
     pending_message: Message | None = None
     provider_session_id: str | None = None
     working_dir: Path | None = None  # Working directory for the session (e.g. project path)
+    # Identity of the user who created the session. Requests for this session must come from
+    # the same caller (see the api.py entry gate), so one user cannot drive another's session
+    # or its sandbox. None on legacy sessions created before ownership existed.
+    owner: str | None = None
     # tool_call_id -> "allow" | "deny": a decision awaiting the next stream so a
     # turn paused at a permission prompt can resume. Set by the resume endpoint,
     # consumed (and cleared) by the stream.
@@ -81,6 +85,7 @@ class Session:
             "working_dir": self.working_dir.as_posix() if self.working_dir else None,
             "pending_tool_decisions": self.pending_tool_decisions,
             "pending_client_tool_results": self.pending_client_tool_results,
+            "owner": self.owner,
         }
 
     @classmethod
@@ -105,6 +110,7 @@ class Session:
             working_dir=Path(data.get("working_dir")) if data.get("working_dir") else None,
             pending_tool_decisions=data.get("pending_tool_decisions") or {},
             pending_client_tool_results=data.get("pending_client_tool_results") or {},
+            owner=data.get("owner"),
         )
 
 
@@ -184,17 +190,68 @@ class SessionManager:
         return Session.from_dict(data)
 
     @staticmethod
-    def create(context: dict[str, Any] | None = None, working_dir: Path | None = None) -> Session:
+    def create(
+        context: dict[str, Any] | None = None,
+        working_dir: Path | None = None,
+        owner: str | None = None,
+    ) -> Session:
         """Create a new session.
 
         Args:
             context: Initial context data, or None
             working_dir: Working directory for the session
+            owner: Identity of the creating user (see the api.py entry gate)
 
         Returns:
             New Session instance
         """
-        return Session(context=context or {}, working_dir=working_dir)
+        return Session(context=context or {}, working_dir=working_dir, owner=owner)
+
+
+def get_container_file(session_id: str) -> Path:
+    """Path of the session's sandbox-binding sidecar."""
+    SessionManager.validate_session_id(session_id)
+    return SESSION_DIR / f"{session_id}.container.json"
+
+
+def save_container_binding(session_id: str, container_id: str, node_id: str) -> None:
+    """Record the session's sandbox container in a sidecar file, so it can be reattached after
+    a server restart. A sidecar (not a Session field) because the Session record is owned and
+    rewritten by the request handler each turn, which would clobber a mid-turn field write; the
+    sidecar is independent of that save path (same pattern as the PID sidecar below).
+    """
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    get_container_file(session_id).write_text(
+        json.dumps({"container_id": container_id, "node_id": node_id})
+    )
+
+
+def clear_container_binding(session_id: str) -> None:
+    try:
+        container_file = get_container_file(session_id)
+    except ValueError:
+        return
+    container_file.unlink(missing_ok=True)
+
+
+def list_container_bindings() -> dict[str, tuple[str, str | None]]:
+    """``{session_id: (container_id, node_id)}`` for every session with a sandbox sidecar.
+    Used on server startup to reattach live sandboxes and reap orphans.
+    """
+    if not SESSION_DIR.exists():
+        return {}
+    bindings: dict[str, tuple[str, str | None]] = {}
+    for path in SESSION_DIR.glob("*.container.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if container_id := data.get("container_id"):
+            bindings[path.name.removesuffix(".container.json")] = (
+                container_id,
+                data.get("node_id"),
+            )
+    return bindings
 
 
 def get_process_file(session_id: str) -> Path:

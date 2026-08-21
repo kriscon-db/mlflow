@@ -1,9 +1,11 @@
 """MLflow AI Gateway preset of the OpenAI-compatible assistant provider."""
 
+import base64
 import logging
 from typing import ClassVar
 
 from mlflow.assistant.providers.openai_compatible import OpenAICompatibleProvider
+from mlflow.environment_variables import _MLFLOW_INTERNAL_GATEWAY_AUTH_TOKEN
 
 _logger = logging.getLogger(__name__)
 
@@ -40,6 +42,22 @@ class MlflowGatewayProvider(OpenAICompatibleProvider):
             chat_url_builder=self._build_chat_url,
             allows_remote_access=True,
         )
+
+    def _auth_headers(self, api_key: str | None, caller: str | None = None) -> dict[str, str]:
+        """Authenticate the server-side call to the in-server AI Gateway.
+
+        When MLflow auth is enabled, the server auto-generates an internal token (shared with
+        this process via ``_MLFLOW_INTERNAL_GATEWAY_AUTH_TOKEN``) that the auth middleware
+        accepts as a Basic-auth password on ``/gateway/`` routes for a given user. We send
+        ``Basic base64(caller:token)`` so the request is authorized and attributed to the
+        user driving the turn — mirroring how job workers authenticate to the Gateway. Falls
+        back to the default (bearer/none) when the token isn't set (e.g. no-auth servers).
+        """
+        token = _MLFLOW_INTERNAL_GATEWAY_AUTH_TOKEN.get()
+        if token and caller:
+            creds = base64.b64encode(f"{caller}:{token}".encode()).decode()
+            return {"Authorization": f"Basic {creds}"}
+        return super()._auth_headers(api_key, caller)
 
     @staticmethod
     def _list_endpoints():

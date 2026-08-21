@@ -7,12 +7,18 @@ from typing import Any
 
 from mlflow.assistant.config import PermissionsConfig
 from mlflow.assistant.custom_view import RENDER_CUSTOM_VIEW_TOOL_NAME
+from mlflow.environment_variables import MLFLOW_ENABLE_ASSISTANT_SANDBOX
 
 _logger = logging.getLogger(__name__)
 
 _FILE_TOOLS = {"Read", "Write", "Edit"}
 # Restricted mode only permits MLflow CLI and Python; anything else needs Full Access.
 _ALLOWED_BASH_COMMANDS = {"mlflow", "python3", "python"}
+# Compute tools that run in the per-session sandbox when MLFLOW_ENABLE_ASSISTANT_SANDBOX is set.
+_SANDBOX_TOOLS = {"Bash", "Read", "Write", "Edit"}
+# Server-side data tools (the data tier): run in the server under the caller's RBAC and
+# materialize results into the sandbox. Names mirror mlflow.server.assistant.sandbox.data_tools.
+_SERVER_DATA_TOOLS = {"search_traces", "get_trace", "log_feedback"}
 
 # Tools executed on the CLIENT (browser), not the server: the assistant loop pauses the turn and
 # waits for a client-submitted result instead of routing the call through execute_tool/the static
@@ -85,7 +91,42 @@ async def execute_tool(
     cwd: Path | None = None,
     tracking_uri: str | None = None,
     permissions: PermissionsConfig | None = None,
+    session_id: str | None = None,
+    caller: str | None = None,
 ) -> tuple[str, bool]:
+    # Data tier: server-side, RBAC-checked read tools that fetch MLflow data as the caller and
+    # materialize it into the sandbox. Run in the server process (which holds the store + identity),
+    # never in the network-isolated sandbox.
+    if session_id and MLFLOW_ENABLE_ASSISTANT_SANDBOX.get() and tool_name in _SERVER_DATA_TOOLS:
+        from mlflow.server.assistant.sandbox.data_tools import run_data_tool
+
+        _logger.info("routing tool %s for session %s -> server data tier", tool_name, session_id)
+        try:
+            return await asyncio.to_thread(
+                run_data_tool, caller, session_id, tool_name, tool_input, tracking_uri
+            )
+        except Exception as e:
+            _logger.exception("data tool failed for %s", tool_name)
+            return f"Data tool failed: {e}", True
+
+    # With the sandbox enabled, compute tools run in the session's isolated container, so the
+    # static host-permission gate is bypassed here — isolation is the boundary. Only the
+    # server-loop providers reach this with a session_id; the CLI providers run their own host
+    # process and are localhost-only, so they never expose host exec to a remote user.
+    if session_id and MLFLOW_ENABLE_ASSISTANT_SANDBOX.get() and tool_name in _SANDBOX_TOOLS:
+        from mlflow.server.assistant.sandbox.integration import run_sandboxed_tool
+
+        _logger.info("routing tool %s for session %s -> sandbox", tool_name, session_id)
+        try:
+            return await asyncio.to_thread(
+                run_sandboxed_tool, session_id, tool_name, tool_input, tracking_uri
+            )
+        except Exception as e:
+            # Docker missing/daemon down, or the sandbox was torn down mid-call: surface a
+            # tool error to the model instead of crashing the streaming turn.
+            _logger.exception("sandbox execution failed for tool %s", tool_name)
+            return f"Sandbox unavailable: {e}", True
+
     perms = permissions or PermissionsConfig()
 
     if (denial := static_permission_error(tool_name, tool_input, perms, cwd)) is not None:
@@ -304,4 +345,84 @@ def build_tools_schema() -> list[dict[str, Any]]:
                 },
             },
         },
-    ]
+    ] + (_DATA_TOOL_SCHEMAS if MLFLOW_ENABLE_ASSISTANT_SANDBOX.get() else [])
+
+
+# Advertised only when the sandbox (data tier) is enabled; execute_tool routes these to the
+# server-side, RBAC-checked data tools which materialize results into the sandbox workspace.
+_DATA_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_traces",
+            "description": (
+                "Search MLflow traces in an experiment and materialize the full trace JSON into "
+                "your sandbox workspace under traces/<trace_id>.json for analysis with the "
+                "compute tools (Bash/Read). Returns a summary of what was written."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "experiment_id": {
+                        "type": "string",
+                        "description": "The experiment to search traces in.",
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description": "Optional MLflow trace filter string.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max traces to fetch (default 10).",
+                    },
+                },
+                "required": ["experiment_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_trace",
+            "description": "Fetch a single MLflow trace by ID and return its full JSON inline.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "trace_id": {"type": "string", "description": "The trace ID to fetch."},
+                },
+                "required": ["trace_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_feedback",
+            "description": (
+                "Attach a feedback assessment (a named score/label with an optional rationale) "
+                "to a trace. Requires write access to the trace's experiment."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "trace_id": {
+                        "type": "string",
+                        "description": "The trace to attach feedback to.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Feedback name, e.g. 'relevance' (default 'feedback').",
+                    },
+                    "value": {
+                        "description": "The feedback value: bool, number, string, list, or object.",
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Optional justification for the feedback.",
+                    },
+                },
+                "required": ["trace_id", "value"],
+            },
+        },
+    },
+]
